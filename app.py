@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk, filedialog, simpledialog
 import cv2
 import pyautogui
 import pygetwindow as gw
@@ -12,6 +12,7 @@ import win32clipboard
 from io import BytesIO
 import glob
 import logging
+import requests
 
 class ScreenTranslatorApp:
     def __init__(self, root):
@@ -34,6 +35,165 @@ class ScreenTranslatorApp:
         self.translated_feed_label = tk.Label(self.translated_feed_window)
         self.translated_feed_label.pack()
 
+    # --- New method using the API to download a chapter and process translation ---
+    def scrape_mangadex(self):
+        # Prompt for the MangaDex chapter URL
+        url = simpledialog.askstring("MangaDex URL", "Enter mangadex.org chapter URL:")
+        if not url:
+            return
+
+        try:
+            # Assume URL format: https://mangadex.org/chapter/<chapter_id>/<page>
+            parts = url.strip().split('/')
+            chapter_id = parts[4]
+            print(f"Extracted chapter id: {chapter_id}")
+        except Exception as e:
+            print("Error parsing URL:", e)
+            return
+
+        # Call the Mangadex API for the chapter
+        api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}?forcePort443=false"
+        try:
+            response = requests.get(api_url)
+            response.raise_for_status()
+            data = response.json()
+            if data.get("result") != "ok":
+                print("API response not OK")
+                return
+        except Exception as e:
+            print("Error calling Mangadex API:", e)
+            return
+
+        base_url = data["baseUrl"]
+        chapter = data["chapter"]
+        hash_val = chapter["hash"]
+        pages = chapter["data"]
+
+        downloaded_files = []
+        for i, filename in enumerate(pages):
+            image_url = f"{base_url}/data/{hash_val}/{filename}"
+            try:
+                img_response = requests.get(image_url)
+                img_response.raise_for_status()
+                file_path = os.path.join(self.download_folder or ".", f"chapter_{chapter_id}_{i+1:03d}.png")
+                with open(file_path, "wb") as f:
+                    f.write(img_response.content)
+                downloaded_files.append(file_path)
+                print(f"Downloaded {file_path}")
+            except Exception as e:
+                print(f"Error downloading {image_url}: {e}")
+
+        # Process each downloaded image through the translation flow
+        translated_images = []
+        for file_path in downloaded_files:
+            translated_img = self.process_translation_for_image(file_path)
+            if translated_img:
+                translated_images.append(translated_img)
+
+        if translated_images:
+            stitched_image = self.stitch_images_vertically(translated_images)
+            self.show_stitched_image(stitched_image)
+            final_path = os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png")
+            stitched_image.save(final_path)
+            print(f"Final manga saved as: {final_path}")
+        else:
+            print("No translated images obtained.")
+
+    def process_translation_for_image(self, image_path):
+        """
+        Mimics your translation flow:
+         - Loads the image,
+         - Updates the live feed,
+         - Copies the image to the clipboard,
+         - Initiates the OCR/translation process,
+         - Waits for the translated image and returns it.
+        """
+        try:
+            img = Image.open(image_path)
+            # Display image on the live feed (simulate a capture)
+            imgtk = ImageTk.PhotoImage(img)
+            self.live_feed_label.imgtk = imgtk
+            self.live_feed_label.configure(image=imgtk)
+            self.root.update()
+
+            # Copy image to clipboard and invoke translation
+            self.copy_image_to_clipboard(img)
+            self.upload_image_to_ocr()
+            # Wait and retrieve the translated image
+            translated_img = self.wait_for_translated_image()
+            return translated_img
+        except Exception as e:
+            print(f"Error translating {image_path}: {e}")
+            return None
+
+    def wait_for_translated_image(self, max_tries=5, retry_interval=1000):
+        import glob
+        tries = 0
+        while tries < max_tries:
+            pattern = os.path.join(self.download_folder, "translated_image_en*.png") if self.download_folder else "translated_image_en*.png"
+            image_files = glob.glob(pattern)
+            if image_files:
+                image_path = image_files[0]
+                print(f"Translated image found: {image_path}")
+                # Use a context manager to open and copy the image, then close it.
+                with Image.open(image_path) as img:
+                    img_copy = img.copy()
+                os.remove(image_path)  # Now that the file is closed, it can be removed.
+                return img_copy
+            else:
+                tries += 1
+                print(f"Waiting for translated image... {tries}/{max_tries}")
+                time.sleep(retry_interval / 1000.0)
+        print("Translated image not found after maximum retries.")
+        return None
+
+    def stitch_images_vertically(self, images):
+        """
+        Stitches a list of PIL Image objects vertically.
+        """
+        widths = [img.width for img in images]
+        heights = [img.height for img in images]
+        max_width = max(widths)
+        total_height = sum(heights)
+        stitched = Image.new("RGB", (max_width, total_height), "white")
+        y_offset = 0
+        for img in images:
+            stitched.paste(img, (0, y_offset))
+            y_offset += img.height
+        return stitched
+
+    def show_stitched_image(self, image):
+        """
+        Displays the stitched manga image in a new window with a vertical scrollbar.
+        """
+        win = tk.Toplevel(self.root)
+        win.title("Translated Manga")
+        canvas = tk.Canvas(win)
+        scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        imgtk = ImageTk.PhotoImage(image)
+        canvas.create_image(0, 0, anchor="nw", image=imgtk)
+        canvas.imgtk = imgtk  # Keep a reference to avoid garbage collection
+        canvas.config(scrollregion=canvas.bbox("all"))
+
+    def copy_image_to_clipboard(self, image):
+        """
+        Copy an image to the Windows clipboard.
+        """
+        from io import BytesIO
+        import win32clipboard
+        output = BytesIO()
+        image.convert('RGB').save(output, 'BMP')
+        data = output.getvalue()[14:]
+        output.close()
+
+        win32clipboard.OpenClipboard()
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
+        win32clipboard.CloseClipboard()
+
     def create_widgets(self):
         self.window_list = ttk.Combobox(self.root, postcommand=self.preview_window)
         self.window_list.grid(row=0, column=0, padx=10, pady=10)
@@ -54,7 +214,22 @@ class ScreenTranslatorApp:
         self.translate_button = ttk.Button(self.root, text="Translate", command=self.manual_translate)
         self.translate_button.grid(row=1, column=2, padx=10, pady=10)  # Adjust column as needed
 
+         # New button to scrape MangaDex chapter via API
+        self.scrape_button = ttk.Button(self.root, text="Scrape MangaDex URL", command=self.scrape_mangadex)
+        self.scrape_button.grid(row=1, column=3, padx=10, pady=10)
+
+        self.enableRotate = tk.IntVar()
+        self.rotate_toggle = ttk.Checkbutton(self.root, text="Rotate Image", variable=self.enableRotate, 
+                                             onvalue=1, offvalue=0, command=self.on_rotate_toggle)
+        self.rotate_toggle.grid(row=1, column=4, padx=10, pady=10)
+
         self.refresh_window_list()
+
+    def on_rotate_toggle(self):
+        if self.enableRotate.get() == 1:
+            print("Enabled rotate image")
+        else:
+            print("Disabled rotate image")
 
     def select_download_folder(self):
         self.download_folder = filedialog.askdirectory(title="Select Folder for Downloaded Translations")
@@ -89,7 +264,7 @@ class ScreenTranslatorApp:
                 new_img.paste(img, ((new_size[0] - original_width) // 2, (new_size[1] - original_height) // 2))
 
                 # Rotate the image by 45 degrees without cropping
-                rotated_img = new_img.rotate(45, expand=True)
+                rotated_img = new_img.rotate(45, expand=True) if self.enableRotate.get() else new_img
 
                 imgtk = ImageTk.PhotoImage(image=rotated_img)
                 self.translated_feed_label.imgtk = imgtk  # Keep a reference!
