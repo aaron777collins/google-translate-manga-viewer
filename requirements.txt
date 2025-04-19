@@ -5,3 +5,4 @@ Pillow
 pygetwindow
 pyautogui
 requests
+beautifulsoup4

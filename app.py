@@ -1,5 +1,5 @@
 import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog
+from tkinter import ttk, filedialog, simpledialog, messagebox
 import cv2
 import pyautogui
 import pygetwindow as gw
@@ -13,6 +13,8 @@ from io import BytesIO
 import glob
 import logging
 import requests
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
 
 class ScreenTranslatorApp:
     def __init__(self, root):
@@ -35,13 +37,76 @@ class ScreenTranslatorApp:
         self.translated_feed_label = tk.Label(self.translated_feed_window)
         self.translated_feed_label.pack()
 
-    # --- New method using the API to download a chapter and process translation ---
-    def scrape_mangadex(self):
-        # Prompt for the MangaDex chapter URL
-        url = simpledialog.askstring("MangaDex URL", "Enter mangadex.org chapter URL:")
+    def scrape_chapter(self):
+        url = simpledialog.askstring("Chapter URL", "Enter a chapter URL:")
         if not url:
             return
 
+        hostname = urlparse(url).netloc.lower()
+        if "mangadex.org" in hostname:
+            return self.scrape_mangadex(url)
+        elif "rawkuma.net" in hostname:
+            return self.scrape_rawkuma(url)
+        else:
+            messagebox.showerror("Unsupported site",
+                                   f"Sorry, I don't know how to scrape {hostname}")
+            
+    def scrape_rawkuma(self, url):
+        # 1) download the HTML
+        try:
+            resp = requests.get(url)
+            resp.raise_for_status()
+        except Exception as e:
+            print("Error fetching RawKuma page:", e)
+            return
+
+        # 2) parse out all images under #readerarea
+        soup = BeautifulSoup(resp.text, "html.parser")
+        reader = soup.find("div", id="readerarea")
+        if not reader:
+            print("No readerarea on page!")
+            return
+
+        # 3) collect and sort by data-index
+        imgs = reader.find_all("img", attrs={"data-index": True})
+        imgs.sort(key=lambda tag: int(tag["data-index"]))
+
+        downloaded = []
+        for tag in imgs:
+            src = tag.get("src")
+            img_url = urljoin(url, src)
+            idx = int(tag["data-index"]) + 1
+            fname = f"rawkuma_{idx:03d}.png"
+            out_path = os.path.join(self.download_folder or ".", fname)
+            try:
+                r = requests.get(img_url)
+                r.raise_for_status()
+                with open(out_path, "wb") as f:
+                    f.write(r.content)
+                downloaded.append(out_path)
+                print(f"Downloaded {out_path}")
+            except Exception as e:
+                print(f"Error downloading {img_url}: {e}")
+
+        # 4) hand off to your existing translation pipeline
+        translated = [
+            self.process_translation_for_image(p)
+            for p in downloaded
+        ]
+        # then exactly as in Mangadex: stitch, show, save…
+        if translated:
+            stitched = self.stitch_images_vertically(translated)
+            self.show_stitched_image(stitched)
+            final = os.path.join(self.download_folder or ".",
+                                 f"translated_rawkuma_{int(time.time())}.png")
+            stitched.save(final)
+            print("Saved final:", final)
+        else:
+            print("No translated images obtained.")
+
+
+    # --- New method using the API to download a chapter and process translation ---
+    def scrape_mangadex(self, url):
         try:
             # Assume URL format: https://mangadex.org/chapter/<chapter_id>/<page>
             parts = url.strip().split('/')
@@ -214,8 +279,8 @@ class ScreenTranslatorApp:
         self.translate_button = ttk.Button(self.root, text="Translate", command=self.manual_translate)
         self.translate_button.grid(row=1, column=2, padx=10, pady=10)  # Adjust column as needed
 
-         # New button to scrape MangaDex chapter via API
-        self.scrape_button = ttk.Button(self.root, text="Scrape MangaDex URL", command=self.scrape_mangadex)
+         # New button to scrape website chapter via API
+        self.scrape_button = ttk.Button(self.root, text="Scrape URL (mangadex or rawkuma)", command=self.scrape_chapter)
         self.scrape_button.grid(row=1, column=3, padx=10, pady=10)
 
         self.enableRotate = tk.IntVar()
