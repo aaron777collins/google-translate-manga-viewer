@@ -69,38 +69,67 @@ class ScreenTranslatorApp:
 
         # 3) collect and sort by data-index
         imgs = reader.find_all("img", attrs={"data-index": True})
-        imgs.sort(key=lambda tag: int(tag["data-index"]))
+        if imgs:
+            imgs.sort(key=lambda t: int(t["data-index"]))
+        else:
+            print("No <img data-index> tags found; falling back to all <img> tags")
+            imgs = [
+                img for img in reader.find_all("img")
+                if (img.get("data-src") or img.get("src"))
+                   and "placeholder" not in (img.get("src") or "")
+            ]
 
         downloaded = []
-        for tag in imgs:
-            src = tag.get("src")
-            img_url = urljoin(url, src)
-            idx = int(tag["data-index"]) + 1
-            fname = f"rawkuma_{idx:03d}.png"
+        for fallback_idx, tag in enumerate(imgs):
+            # 4) handle lazy‑loaded images
+            src = tag.get("data-src") or tag.get("src")
+            # if data-index exists and is numeric, use that; else use fallback order
+            if tag.get("data-index") and tag["data-index"].isdigit():
+                page_num = int(tag["data-index"]) + 1
+            else:
+                page_num = fallback_idx + 1
+            fname = f"rawkuma_{page_num:03d}.png"
+
+
             out_path = os.path.join(self.download_folder or ".", fname)
             try:
-                r = requests.get(img_url)
+                r = requests.get(urljoin(url, src))
                 r.raise_for_status()
                 with open(out_path, "wb") as f:
                     f.write(r.content)
                 downloaded.append(out_path)
                 print(f"Downloaded {out_path}")
             except Exception as e:
-                print(f"Error downloading {img_url}: {e}")
+                print(f"Error downloading {src}: {e}")
 
-        # 4) hand off to your existing translation pipeline
-        translated = [
-            self.process_translation_for_image(p)
-            for p in downloaded
-        ]
+        # Process each downloaded image and save each translation
+        translated = []
+        for i, img_path in enumerate(downloaded, start=1):
+            t_img = self.process_translation_for_image(img_path)
+            if not t_img:
+                continue
+
+            # save individual translated page
+            individual_name = f"translated_rawkuma_{i:03d}.png"
+            individual_path = os.path.normpath(
+                os.path.join(self.download_folder or ".", individual_name)
+            )
+            t_img.save(individual_path)
+            print(f"Saved translated page: {individual_path}")
+
+            translated.append(t_img)
+
         # then exactly as in Mangadex: stitch, show, save…
         if translated:
             stitched = self.stitch_images_vertically(translated)
             self.show_stitched_image(stitched)
-            final = os.path.join(self.download_folder or ".",
-                                 f"translated_rawkuma_{int(time.time())}.png")
-            stitched.save(final)
+            raw = os.path.join(
+                 self.download_folder or ".",
+                f"translated_rawkuma_{int(time.time())}.png"
+             )
+            final = os.path.normpath(raw)
             print("Saved final:", final)
+            stitched.save(final)
         else:
             print("No translated images obtained.")
 
@@ -150,15 +179,26 @@ class ScreenTranslatorApp:
 
         # Process each downloaded image through the translation flow
         translated_images = []
-        for file_path in downloaded_files:
+        for i, file_path in enumerate(downloaded_files, start=1):
             translated_img = self.process_translation_for_image(file_path)
-            if translated_img:
-                translated_images.append(translated_img)
+            if not translated_img:
+                continue
+
+            # 1) save the individual translated page
+            individual_name = f"translated_{chapter_id}_{i:03d}.png"
+            individual_path = os.path.normpath(
+                os.path.join(self.download_folder or ".", individual_name)
+            )
+            translated_img.save(individual_path)
+            print(f"Saved translated page: {individual_path}")
+
+            # 2) collect for later stitching
+            translated_images.append(translated_img)
 
         if translated_images:
             stitched_image = self.stitch_images_vertically(translated_images)
             self.show_stitched_image(stitched_image)
-            final_path = os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png")
+            final_path = os.path.normpath(os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png"))
             stitched_image.save(final_path)
             print(f"Final manga saved as: {final_path}")
         else:
