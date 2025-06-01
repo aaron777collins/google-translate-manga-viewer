@@ -117,6 +117,12 @@ class ScreenTranslatorApp:
             t_img.save(individual_path)
             print(f"Saved translated page: {individual_path}")
 
+            # ── NEW: rotate + save ──────────────────────────────────────
+            rotated = t_img.transpose(Image.ROTATE_90)     # 2)  90° counter-clockwise
+            rotated_path = individual_path.replace(".png", ".rotated.png")
+            rotated.save(rotated_path)                     # 3)
+            print(f"Saved rotated page:  {rotated_path}")
+
             translated.append(t_img)
 
         # then exactly as in Mangadex: stitch, show, save…

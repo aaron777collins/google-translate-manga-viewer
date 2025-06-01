@@ -6,3 +6,4 @@ pygetwindow
 pyautogui
 requests
 beautifulsoup4
+numpy
