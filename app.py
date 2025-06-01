@@ -486,8 +486,8 @@ class ScreenTranslatorApp:
         self.activate_window("Google Translate")
         original_x, original_y = pyautogui.position()
         click_image("translateimages0.png")
-        # wait 3 seconds for the image to be uploaded
-        time.sleep(3)
+        # wait 5 seconds for the image to be uploaded
+        time.sleep(5)
         click_image("translateimages1.png", max_tries=3, retry_interval=5)
         click_image("translateimages2.png")
         # move the cursor back to the original location
