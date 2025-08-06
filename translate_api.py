@@ -94,6 +94,8 @@ from flask import Flask, request, jsonify, abort
 from google.cloud import vision
 from google.cloud import translate_v3 as translate
 from PIL import Image, ImageDraw, ImageFont
+from sklearn.cluster import DBSCAN
+import numpy as np
 
 
 # ---------------------------------------------------------------------------
@@ -148,105 +150,120 @@ def ocr_image(img_bytes: bytes):
         abort(500, f"Vision API error: {response.error.message}")
     return response
 
+def cluster_blocks(blocks, max_distance=50):
+    centers = []
+    for block in blocks:
+        x = block.bounding_box.vertices[0].x
+        y = block.bounding_box.vertices[0].y
+        centers.append([x, y])
+
+    clustering = DBSCAN(eps=max_distance, min_samples=1).fit(centers)
+    clusters = [[] for _ in range(max(clustering.labels_) + 1)]
+
+    for idx, label in enumerate(clustering.labels_):
+        clusters[label].append(blocks[idx])
+
+    return clusters
+
 
 def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> bytes:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img, "RGBA")
 
-    # Use local bold font bundled with the app
     preferred_font_path = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
     base_font_size = 24
 
-    # Helper: Try to load the TTF font, fallback if missing/broken
     def load_font(size: int):
         if os.path.isfile(preferred_font_path):
             try:
                 return ImageFont.truetype(preferred_font_path, size)
-            except Exception as e:
-                print(f"Font load failed: {e}")
+            except Exception:
+                pass
         return ImageFont.load_default()
 
+    # Flatten all blocks and get centers for clustering
+    all_blocks = []
+    block_centers = []
     for page in ocr_annotation.pages:
         for block in page.blocks:
-            for paragraph in block.paragraphs:
-                full_text = ""
-                bbox_coords = []
+            all_blocks.append(block)
+            v = block.bounding_box.vertices
+            x = (v[0].x + v[2].x) / 2
+            y = (v[0].y + v[2].y) / 2
+            block_centers.append([x, y])
 
+    clustering = DBSCAN(eps=60, min_samples=1).fit(np.array(block_centers))
+    clustered_blocks = {}
+    for idx, label in enumerate(clustering.labels_):
+        clustered_blocks.setdefault(label, []).append(all_blocks[idx])
+
+    for cluster_blocks in clustered_blocks.values():
+        full_text = ""
+        all_coords = []
+
+        for block in cluster_blocks:
+            for paragraph in block.paragraphs:
                 for word in paragraph.words:
                     word_text = "".join([s.text for s in word.symbols])
                     full_text += word_text + " "
-                    box_vertices = word.bounding_box.vertices
-                    if len(box_vertices) == 4:
-                        x0, y0 = box_vertices[0].x, box_vertices[0].y
-                        x2, y2 = box_vertices[2].x, box_vertices[2].y
-                        # Skip vertical or rotated
-                        if abs(y2 - y0) > abs(x2 - x0):
-                            continue
-                        bbox_coords.append((x0, y0, x2, y2))
+                    v = word.bounding_box.vertices
+                    if len(v) == 4:
+                        all_coords.append((v[0].x, v[0].y, v[2].x, v[2].y))
 
-                full_text = full_text.strip()
-                if not full_text or not bbox_coords:
-                    continue
+        full_text = full_text.strip()
+        if not full_text or not all_coords:
+            continue
 
-                try:
-                    translated = translate_text(full_text, target_lang)
-                except Exception:
-                    translated = "[translation error]"
+        try:
+            translated = translate_text(full_text, target_lang)
+        except Exception:
+            translated = "[translation error]"
 
-                # Get bounding box for paragraph
-                min_x = min(x0 for x0, _, _, _ in bbox_coords)
-                min_y = min(y0 for _, y0, _, _ in bbox_coords)
-                max_x = max(x2 for _, _, x2, _ in bbox_coords)
-                max_y = max(y2 for _, _, _, y2 in bbox_coords)
+        min_x = min(x0 for x0, _, _, _ in all_coords)
+        min_y = min(y0 for _, y0, _, _ in all_coords)
+        max_x = max(x2 for _, _, x2, _ in all_coords)
+        max_y = max(y2 for _, _, _, y2 in all_coords)
 
-                box_width = max_x - min_x
-                box_height = max_y - min_y
+        box_width = max_x - min_x
+        box_height = max_y - min_y
 
-                # Dynamically shrink font to fit and expand box height if needed
-                font_size = base_font_size
-                padding = 4
-                spacing = 2
+        font_size = base_font_size
+        padding = 4
+        spacing = 2
 
-                while font_size > 8:
-                    font = load_font(font_size)
-                    wrap_width = max(1, box_width // max(1, font_size // 2))
-                    wrapped = textwrap.fill(translated, width=wrap_width)
-                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
-                    text_w = bbox[2] - bbox[0]
-                    text_h = bbox[3] - bbox[1]
-                    if text_w + 2 * padding <= box_width and text_h + 2 * padding <= box_height:
-                        break
-                    font_size -= 1
-                else:
-                    font = load_font(10)
-                    wrap_width = max(1, box_width // 5)
-                    wrapped = textwrap.fill(translated, width=wrap_width)
-                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
-                    text_w = bbox[2] - bbox[0]
-                    text_h = bbox[3] - bbox[1]
+        while font_size > 8:
+            font = load_font(font_size)
+            wrap_width = max(1, box_width // max(1, font_size // 2))
+            wrapped = textwrap.fill(translated, width=wrap_width)
+            bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            if text_w + 2 * padding <= box_width and text_h + 2 * padding <= box_height:
+                break
+            font_size -= 1
+        else:
+            font = load_font(10)
+            wrap_width = max(1, box_width // 5)
+            wrapped = textwrap.fill(translated, width=wrap_width)
+            bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
 
-                    # Ensure box is tall enough for rendered text
-                    final_max_y = max(max_y, min_y + text_h + 2 * padding)
+        final_max_y = max(max_y, min_y + text_h + 2 * padding)
+        x0, x1 = sorted((int(min_x), int(max_x)))
+        y0, y1 = sorted((int(min_y), int(final_max_y)))
 
-                    # Normalize coordinates (required by Pillow)
-                    x0, x1 = sorted((int(min_x), int(max_x)))
-                    y0, y1 = sorted((int(min_y), int(final_max_y)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            continue
 
-                    # Skip invalid rectangles
-                    if x1 - x0 < 4 or y1 - y0 < 4:
-                        continue
-
-                    # Draw background
-                    draw.rectangle([(x0, y0), (x1, y1)], fill=(0, 0, 0, 180))
-
-                    # Draw text
-                    draw.multiline_text(
-                        (x0 + padding, y0 + padding),
-                        wrapped,
-                        fill=(255, 255, 255, 255),
-                        font=font,
-                        spacing=spacing
-                    )
+        draw.rectangle([(x0, y0), (x1, y1)], fill=(0, 0, 0, 180))
+        draw.multiline_text(
+            (x0 + padding, y0 + padding),
+            wrapped,
+            fill=(255, 255, 255, 255),
+            font=font,
+            spacing=spacing
+        )
 
     out = io.BytesIO()
     img.save(out, format="PNG")
