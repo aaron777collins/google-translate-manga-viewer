@@ -202,33 +202,45 @@ def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> b
                 box_width = max_x - min_x
                 box_height = max_y - min_y
 
-                # Dynamically shrink font to fit
+                # Dynamically shrink font to fit and expand box height if needed
                 font_size = base_font_size
+                padding = 4
+                spacing = 2
+
                 while font_size > 8:
                     font = load_font(font_size)
                     wrap_width = max(1, box_width // max(1, font_size // 2))
                     wrapped = textwrap.fill(translated, width=wrap_width)
-                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=2)
+                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
                     text_w = bbox[2] - bbox[0]
                     text_h = bbox[3] - bbox[1]
-
-                    if text_w <= box_width and text_h <= box_height:
+                    if text_w + 2 * padding <= box_width and text_h + 2 * padding <= box_height:
                         break
                     font_size -= 1
                 else:
                     font = load_font(10)
-                    wrapped = textwrap.fill(translated, width=box_width // 5)
+                    wrap_width = max(1, box_width // 5)
+                    wrapped = textwrap.fill(translated, width=wrap_width)
+                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=spacing)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
 
-                # Draw translucent background
-                draw.rectangle([(min_x, min_y), (max_x, max_y)], fill=(0, 0, 0, 180))
+                # Ensure box is tall enough for rendered text
+                final_max_y = max(max_y, min_y + text_h + 2 * padding)
 
-                # Overlay text
+                # Draw background
+                draw.rectangle(
+                    [(min_x, min_y), (max_x, final_max_y)],
+                    fill=(0, 0, 0, 180)
+                )
+
+                # Draw text
                 draw.multiline_text(
-                    (min_x + 4, min_y + 2),
+                    (min_x + padding, min_y + padding),
                     wrapped,
                     fill=(255, 255, 255, 255),
                     font=font,
-                    spacing=2
+                    spacing=spacing
                 )
 
     out = io.BytesIO()
