@@ -1,6 +1,3 @@
-opencv-python
-pytesseract
-googletrans==4.0.0rc1
 pygetwindow
 pyautogui
 requests

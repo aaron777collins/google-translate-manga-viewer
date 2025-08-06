@@ -87,12 +87,14 @@ import os
 import io
 import base64
 import secrets
+import textwrap
 from typing import Tuple
 
 from flask import Flask, request, jsonify, abort
 from google.cloud import vision
 from google.cloud import translate_v3 as translate
 from PIL import Image, ImageDraw, ImageFont
+
 
 # ---------------------------------------------------------------------------
 # Mandatory configuration – fail fast if missing.
