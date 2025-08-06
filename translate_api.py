@@ -225,23 +225,28 @@ def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> b
                     text_w = bbox[2] - bbox[0]
                     text_h = bbox[3] - bbox[1]
 
-                # Ensure box is tall enough for rendered text
-                final_max_y = max(max_y, min_y + text_h + 2 * padding)
+                    # Ensure box is tall enough for rendered text
+                    final_max_y = max(max_y, min_y + text_h + 2 * padding)
 
-                # Draw background
-                draw.rectangle(
-                    [(min_x, min_y), (max_x, final_max_y)],
-                    fill=(0, 0, 0, 180)
-                )
+                    # Normalize coordinates (required by Pillow)
+                    x0, x1 = sorted((int(min_x), int(max_x)))
+                    y0, y1 = sorted((int(min_y), int(final_max_y)))
 
-                # Draw text
-                draw.multiline_text(
-                    (min_x + padding, min_y + padding),
-                    wrapped,
-                    fill=(255, 255, 255, 255),
-                    font=font,
-                    spacing=spacing
-                )
+                    # Skip invalid rectangles
+                    if x1 - x0 < 4 or y1 - y0 < 4:
+                        continue
+
+                    # Draw background
+                    draw.rectangle([(x0, y0), (x1, y1)], fill=(0, 0, 0, 180))
+
+                    # Draw text
+                    draw.multiline_text(
+                        (x0 + padding, y0 + padding),
+                        wrapped,
+                        fill=(255, 255, 255, 255),
+                        font=font,
+                        spacing=spacing
+                    )
 
     out = io.BytesIO()
     img.save(out, format="PNG")
