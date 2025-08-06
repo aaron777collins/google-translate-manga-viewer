@@ -192,7 +192,7 @@ def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> b
             y = (v[0].y + v[2].y) / 2
             block_centers.append([x, y])
 
-    clustering = DBSCAN(eps=60, min_samples=1).fit(np.array(block_centers))
+    clustering = DBSCAN(eps=100, min_samples=1).fit(np.array(block_centers))
     clustered_blocks = {}
     for idx, label in enumerate(clustering.labels_):
         clustered_blocks.setdefault(label, []).append(all_blocks[idx])
