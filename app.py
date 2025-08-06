@@ -85,8 +85,9 @@ class ScreenTranslatorApp:
             messagebox.showerror("Unsupported site",
                                    f"Sorry, I don't know how to scrape {hostname}")
             
-    def scrape_rawkuma(self, url):
-        # 1) download the HTML
+    def _scrape_rawkuma_worker(self, url):
+        print(f"[Thread] Running rawkuma scrape in thread: {threading.current_thread().name}")
+
         try:
             resp = requests.get(url)
             resp.raise_for_status()
@@ -94,14 +95,12 @@ class ScreenTranslatorApp:
             print("Error fetching RawKuma page:", e)
             return
 
-        # 2) parse out all images under #readerarea
         soup = BeautifulSoup(resp.text, "html.parser")
         reader = soup.find("div", id="readerarea")
         if not reader:
             print("No readerarea on page!")
             return
 
-        # 3) collect and sort by data-index
         imgs = reader.find_all("img", attrs={"data-index": True})
         if imgs:
             imgs.sort(key=lambda t: int(t["data-index"]))
@@ -110,21 +109,17 @@ class ScreenTranslatorApp:
             imgs = [
                 img for img in reader.find_all("img")
                 if (img.get("data-src") or img.get("src"))
-                   and "placeholder" not in (img.get("src") or "")
+                and "placeholder" not in (img.get("src") or "")
             ]
 
         downloaded = []
         for fallback_idx, tag in enumerate(imgs):
-            # 4) handle lazy‑loaded images
             src = tag.get("data-src") or tag.get("src")
-            # if data-index exists and is numeric, use that; else use fallback order
             if tag.get("data-index") and tag["data-index"].isdigit():
                 page_num = int(tag["data-index"]) + 1
             else:
                 page_num = fallback_idx + 1
             fname = f"rawkuma_{page_num:03d}.png"
-
-
             out_path = os.path.join(self.download_folder or ".", fname)
             try:
                 r = requests.get(urljoin(url, src))
@@ -136,7 +131,6 @@ class ScreenTranslatorApp:
             except Exception as e:
                 print(f"Error downloading {src}: {e}")
 
-        # Process each downloaded image and save each translation
         def translate_and_save_rawkuma(index, img_path, max_retries=3, timeout=30):
             for attempt in range(max_retries):
                 try:
@@ -155,44 +149,55 @@ class ScreenTranslatorApp:
                         rotated.save(rotated_path)
                         print(f"Saved rotated page:  {rotated_path}")
 
-                    return (index, translated_img)
-
+                    return (index, translated_img.copy())
                 except Exception as e:
                     print(f"[Retry {attempt+1}/{max_retries}] Error translating image {img_path}: {e}")
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                    time.sleep(2 ** attempt)
 
             print(f"[FAILED] Max retries exceeded for image {img_path}")
             return (index, None)
 
-        # Start thread pool translation
         translated = []
-        with ThreadPoolExecutor(max_workers=50) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(translate_and_save_rawkuma, idx + 1, path)
                     for idx, path in enumerate(downloaded)]
             for future in as_completed(futures):
-                idx, result = future.result()
-                if result:
-                    translated.append((idx, result))
+                try:
+                    idx, result = future.result()
+                    if result:
+                        translated.append((idx, result))
+                except Exception as e:
+                    print(f"❌ Future failed: {e}")
 
-        # Sort and extract images
         translated.sort(key=lambda x: x[0])
         translated_images = [img for _, img in translated]
 
         if translated_images:
             stitched = self.stitch_images_vertically(translated_images)
-            self.show_stitched_image(stitched)
-            raw = os.path.join(self.download_folder or ".", f"translated_rawkuma_{int(time.time())}.png")
-            final = os.path.normpath(raw)
-            print("Saved final:", final)
-            stitched.save(final)
+            print("🧵 Stitching complete.")
+
+            # Schedule display & save on main thread
+            def show_and_save():
+                self.show_stitched_image(stitched)
+                final = os.path.normpath(
+                    os.path.join(self.download_folder or ".", f"translated_rawkuma_{int(time.time())}.png")
+                )
+                stitched.save(final)
+                print("✅ Saved final:", final)
+
+            self.root.after(0, show_and_save)
         else:
             print("No translated images obtained.")
 
+    def scrape_rawkuma(self, url):
+        print(f"[MainThread] Starting background scrape of {url}")
+        threading.Thread(target=self._scrape_rawkuma_worker, args=(url,), daemon=True).start()
 
     # --- New method using the API to download a chapter and process translation ---
-    def scrape_mangadex(self, url):
+    def _scrape_mangadex_worker(self, url):
+        print(f"[Thread] Running mangadex scrape in thread: {threading.current_thread().name}")
+
         try:
-            # Assume URL format: https://mangadex.org/chapter/<chapter_id>/<page>
             parts = url.strip().split('/')
             chapter_id = parts[4]
             print(f"Extracted chapter id: {chapter_id}")
@@ -200,7 +205,6 @@ class ScreenTranslatorApp:
             print("Error parsing URL:", e)
             return
 
-        # Call the Mangadex API for the chapter
         api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}?forcePort443=false"
         try:
             response = requests.get(api_url)
@@ -232,7 +236,6 @@ class ScreenTranslatorApp:
             except Exception as e:
                 print(f"Error downloading {image_url}: {e}")
 
-        # Process each downloaded image through the translation flow
         def translate_and_save_mangadex(index, file_path, max_retries=3, timeout=30):
             for attempt in range(max_retries):
                 try:
@@ -245,8 +248,7 @@ class ScreenTranslatorApp:
                     translated_img.save(individual_path)
                     print(f"Saved translated page: {individual_path}")
 
-                    return (index, translated_img)
-
+                    return (index, translated_img.copy())  # <- copy ensures safe image reuse
                 except Exception as e:
                     print(f"[Retry {attempt+1}/{max_retries}] Error translating image {file_path}: {e}")
                     time.sleep(2 ** attempt)
@@ -255,25 +257,37 @@ class ScreenTranslatorApp:
             return (index, None)
 
         translated = []
-        with ThreadPoolExecutor(max_workers=50) as executor:
+        with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(translate_and_save_mangadex, idx + 1, path)
                     for idx, path in enumerate(downloaded_files)]
             for future in as_completed(futures):
-                idx, img = future.result()
-                if img:
-                    translated.append((idx, img))
+                try:
+                    idx, img = future.result()
+                    if img:
+                        translated.append((idx, img))
+                except Exception as e:
+                    print(f"❌ Future failed: {e}")
 
         translated.sort(key=lambda x: x[0])
         translated_images = [img for _, img in translated]
 
         if translated_images:
             stitched_image = self.stitch_images_vertically(translated_images)
-            self.show_stitched_image(stitched_image)
-            final_path = os.path.normpath(os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png"))
-            stitched_image.save(final_path)
-            print(f"Final manga saved as: {final_path}")
+            print("🧵 Stitching complete.")
+
+            def show_and_save():
+                self.show_stitched_image(stitched_image)
+                final_path = os.path.normpath(os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png"))
+                stitched_image.save(final_path)
+                print(f"✅ Final manga saved as: {final_path}")
+
+            self.root.after(0, show_and_save)
         else:
             print("No translated images obtained.")
+
+    def scrape_mangadex(self, url):
+        print(f"[MainThread] Starting background scrape of {url}")
+        threading.Thread(target=self._scrape_mangadex_worker, args=(url,), daemon=True).start()
 
     def translate_via_api(self, pil_image, target="en", timeout=30):
         """Send PIL image to translator API and get back a PIL image."""
