@@ -1,9 +1,13 @@
 opencv-python
 pytesseract
 googletrans==4.0.0rc1
-Pillow
 pygetwindow
 pyautogui
 requests
 beautifulsoup4
 numpy
+Flask==3.0.*
+gunicorn==22.*
+google-cloud-vision>=3.9.0
+google-cloud-translate>=3.12.4
+pillow>=10.0.0
