@@ -27,21 +27,31 @@ class ScreenTranslatorApp:
 
         load_dotenv()
         self.api_password = os.getenv("API_PASSWORD")
+        self.api_url      = os.getenv("API_URL") \
+                    or "https://translate.aaroncollins.info/translate-image"
 
-        # ── ask user which pipeline to use ───────────────────────────
         mode = tk.simpledialog.askstring(
             "Translation mode",
             "Type 'api' to use Translator API\nor 'scrape' to drive browser:",
         )
+
         self.use_api = (mode or "").strip().lower() == "api"
 
-        if self.use_api and not self.api_password:
-            # prompt once; keep in memory
-            self.api_password = tk.simpledialog.askstring(
-                "API password",
-                "Enter secret password:",
-                show="*",
-            )
+        if self.use_api:
+            if not self.api_password:
+                # ask for password only if .env didn’t provide it
+                self.api_password = tk.simpledialog.askstring(
+                    "API password",
+                    "Enter X-API-KEY password:",
+                    show="*",
+                )
+            if not self.api_url:
+                # same for the URL
+                self.api_url = tk.simpledialog.askstring(
+                    "API URL",
+                    "Enter full https URL for translator:",
+                    initialvalue="https://translate.aaroncollins.info/translate-image",
+                )
 
         self.running = False
 
@@ -243,12 +253,13 @@ class ScreenTranslatorApp:
         buf.seek(0)
 
         resp = requests.post(
-            "https://translate.aaroncollins.info/translate-image",
+            self.api_url,
             headers={"X-API-KEY": self.api_password},
             files={"file": ("page.png", buf.getvalue(), "image/png")},
             data={"target": target},
             timeout=90,
         )
+
         resp.raise_for_status()
         b64_png = resp.json()["translated_image"].split(",", 1)[1]
         return Image.open(BytesIO(base64.b64decode(b64_png)))
