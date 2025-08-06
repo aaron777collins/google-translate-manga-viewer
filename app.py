@@ -19,6 +19,7 @@ from dotenv import load_dotenv
 import base64
 from io import BytesIO
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 class ScreenTranslatorApp:
     def __init__(self, root):
@@ -136,36 +137,42 @@ class ScreenTranslatorApp:
                 print(f"Error downloading {src}: {e}")
 
         # Process each downloaded image and save each translation
-        translated = []
-        for i, img_path in enumerate(downloaded, start=1):
+        def translate_and_save_rawkuma(index, img_path):
             t_img = self.process_translation_for_image(img_path)
             if not t_img:
-                continue
+                return (index, None)
 
-            # save individual translated page
-            individual_name = f"translated_rawkuma_{i:03d}.png"
-            individual_path = os.path.normpath(
-                os.path.join(self.download_folder or ".", individual_name)
-            )
+            individual_name = f"translated_rawkuma_{index:03d}.png"
+            individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
             t_img.save(individual_path)
             print(f"Saved translated page: {individual_path}")
 
-            # ── NEW: rotate + save ──────────────────────────────────────
-            rotated = t_img.transpose(Image.ROTATE_90)     # 2)  90° counter-clockwise
-            rotated_path = individual_path.replace(".png", ".rotated.png")
-            rotated.save(rotated_path)                     # 3)
-            print(f"Saved rotated page:  {rotated_path}")
+            if self.enableRotate.get():
+                rotated = t_img.transpose(Image.ROTATE_90)
+                rotated_path = individual_path.replace(".png", ".rotated.png")
+                rotated.save(rotated_path)
+                print(f"Saved rotated page:  {rotated_path}")
 
-            translated.append(t_img)
+            return (index, t_img)
 
-        # then exactly as in Mangadex: stitch, show, save…
-        if translated:
-            stitched = self.stitch_images_vertically(translated)
+        # Start thread pool translation
+        translated = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(translate_and_save_rawkuma, idx + 1, path)
+                    for idx, path in enumerate(downloaded)]
+            for future in as_completed(futures):
+                idx, result = future.result()
+                if result:
+                    translated.append((idx, result))
+
+        # Sort and extract images
+        translated.sort(key=lambda x: x[0])
+        translated_images = [img for _, img in translated]
+
+        if translated_images:
+            stitched = self.stitch_images_vertically(translated_images)
             self.show_stitched_image(stitched)
-            raw = os.path.join(
-                 self.download_folder or ".",
-                f"translated_rawkuma_{int(time.time())}.png"
-             )
+            raw = os.path.join(self.download_folder or ".", f"translated_rawkuma_{int(time.time())}.png")
             final = os.path.normpath(raw)
             print("Saved final:", final)
             stitched.save(final)
@@ -217,22 +224,29 @@ class ScreenTranslatorApp:
                 print(f"Error downloading {image_url}: {e}")
 
         # Process each downloaded image through the translation flow
-        translated_images = []
-        for i, file_path in enumerate(downloaded_files, start=1):
+        def translate_and_save_mangadex(index, file_path):
             translated_img = self.process_translation_for_image(file_path)
             if not translated_img:
-                continue
+                return (index, None)
 
-            # 1) save the individual translated page
-            individual_name = f"translated_{chapter_id}_{i:03d}.png"
-            individual_path = os.path.normpath(
-                os.path.join(self.download_folder or ".", individual_name)
-            )
+            individual_name = f"translated_{chapter_id}_{index:03d}.png"
+            individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
             translated_img.save(individual_path)
             print(f"Saved translated page: {individual_path}")
 
-            # 2) collect for later stitching
-            translated_images.append(translated_img)
+            return (index, translated_img)
+
+        translated = []
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            futures = [executor.submit(translate_and_save_mangadex, idx + 1, path)
+                    for idx, path in enumerate(downloaded_files)]
+            for future in as_completed(futures):
+                idx, img = future.result()
+                if img:
+                    translated.append((idx, img))
+
+        translated.sort(key=lambda x: x[0])
+        translated_images = [img for _, img in translated]
 
         if translated_images:
             stitched_image = self.stitch_images_vertically(translated_images)
