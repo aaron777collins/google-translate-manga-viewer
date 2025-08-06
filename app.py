@@ -137,27 +137,36 @@ class ScreenTranslatorApp:
                 print(f"Error downloading {src}: {e}")
 
         # Process each downloaded image and save each translation
-        def translate_and_save_rawkuma(index, img_path):
-            t_img = self.process_translation_for_image(img_path)
-            if not t_img:
-                return (index, None)
+        def translate_and_save_rawkuma(index, img_path, max_retries=3, timeout=30):
+            for attempt in range(max_retries):
+                try:
+                    translated_img = self.process_translation_for_image(img_path, timeout=timeout)
+                    if not translated_img:
+                        raise Exception("Translation returned None")
 
-            individual_name = f"translated_rawkuma_{index:03d}.png"
-            individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
-            t_img.save(individual_path)
-            print(f"Saved translated page: {individual_path}")
+                    individual_name = f"translated_rawkuma_{index:03d}.png"
+                    individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
+                    translated_img.save(individual_path)
+                    print(f"Saved translated page: {individual_path}")
 
-            if self.enableRotate.get():
-                rotated = t_img.transpose(Image.ROTATE_90)
-                rotated_path = individual_path.replace(".png", ".rotated.png")
-                rotated.save(rotated_path)
-                print(f"Saved rotated page:  {rotated_path}")
+                    if self.enableRotate.get():
+                        rotated = translated_img.transpose(Image.ROTATE_90)
+                        rotated_path = individual_path.replace(".png", ".rotated.png")
+                        rotated.save(rotated_path)
+                        print(f"Saved rotated page:  {rotated_path}")
 
-            return (index, t_img)
+                    return (index, translated_img)
+
+                except Exception as e:
+                    print(f"[Retry {attempt+1}/{max_retries}] Error translating image {img_path}: {e}")
+                    time.sleep(2 ** attempt)  # Exponential backoff
+
+            print(f"[FAILED] Max retries exceeded for image {img_path}")
+            return (index, None)
 
         # Start thread pool translation
         translated = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=50) as executor:
             futures = [executor.submit(translate_and_save_rawkuma, idx + 1, path)
                     for idx, path in enumerate(downloaded)]
             for future in as_completed(futures):
@@ -224,20 +233,29 @@ class ScreenTranslatorApp:
                 print(f"Error downloading {image_url}: {e}")
 
         # Process each downloaded image through the translation flow
-        def translate_and_save_mangadex(index, file_path):
-            translated_img = self.process_translation_for_image(file_path)
-            if not translated_img:
-                return (index, None)
+        def translate_and_save_mangadex(index, file_path, max_retries=3, timeout=30):
+            for attempt in range(max_retries):
+                try:
+                    translated_img = self.process_translation_for_image(file_path, timeout=timeout)
+                    if not translated_img:
+                        raise Exception("Translation returned None")
 
-            individual_name = f"translated_{chapter_id}_{index:03d}.png"
-            individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
-            translated_img.save(individual_path)
-            print(f"Saved translated page: {individual_path}")
+                    individual_name = f"translated_{chapter_id}_{index:03d}.png"
+                    individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
+                    translated_img.save(individual_path)
+                    print(f"Saved translated page: {individual_path}")
 
-            return (index, translated_img)
+                    return (index, translated_img)
+
+                except Exception as e:
+                    print(f"[Retry {attempt+1}/{max_retries}] Error translating image {file_path}: {e}")
+                    time.sleep(2 ** attempt)
+
+            print(f"[FAILED] Max retries exceeded for image {file_path}")
+            return (index, None)
 
         translated = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
+        with ThreadPoolExecutor(max_workers=50) as executor:
             futures = [executor.submit(translate_and_save_mangadex, idx + 1, path)
                     for idx, path in enumerate(downloaded_files)]
             for future in as_completed(futures):
