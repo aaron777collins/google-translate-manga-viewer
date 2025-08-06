@@ -15,11 +15,34 @@ import logging
 import requests
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+import base64
+from io import BytesIO
+import requests
 
 class ScreenTranslatorApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Screen Translator")
+
+        load_dotenv()
+        self.api_password = os.getenv("API_PASSWORD")
+
+        # ── ask user which pipeline to use ───────────────────────────
+        mode = tk.simpledialog.askstring(
+            "Translation mode",
+            "Type 'api' to use Translator API\nor 'scrape' to drive browser:",
+        )
+        self.use_api = (mode or "").strip().lower() == "api"
+
+        if self.use_api and not self.api_password:
+            # prompt once; keep in memory
+            self.api_password = tk.simpledialog.askstring(
+                "API password",
+                "Enter secret password:",
+                show="*",
+            )
+
         self.running = False
 
         # Prompt user to select download folder
@@ -210,6 +233,26 @@ class ScreenTranslatorApp:
         else:
             print("No translated images obtained.")
 
+    def translate_via_api(self, pil_image, target="en"):
+        """Send PIL image to translator API and get back a PIL image."""
+        if not self.api_password:
+            raise RuntimeError("API password not set")
+
+        buf = BytesIO()
+        pil_image.save(buf, format="PNG")
+        buf.seek(0)
+
+        resp = requests.post(
+            "https://translate.aaroncollins.info/translate-image",
+            headers={"X-API-KEY": self.api_password},
+            files={"file": ("page.png", buf.getvalue(), "image/png")},
+            data={"target": target},
+            timeout=90,
+        )
+        resp.raise_for_status()
+        b64_png = resp.json()["translated_image"].split(",", 1)[1]
+        return Image.open(BytesIO(base64.b64decode(b64_png)))
+
     def process_translation_for_image(self, image_path):
         """
         Mimics your translation flow:
@@ -222,6 +265,12 @@ class ScreenTranslatorApp:
         try:
             img = Image.open(image_path)
             # Display image on the live feed (simulate a capture)
+
+            if self.use_api:
+                # ── NEW: call micro-service ───────────────────────────────
+                translated_img = self.translate_via_api(img)
+                return translated_img
+
             imgtk = ImageTk.PhotoImage(img)
             self.live_feed_label.imgtk = imgtk
             self.live_feed_label.configure(image=imgtk)
