@@ -262,7 +262,9 @@ def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> b
             wrapped,
             fill=(255, 255, 255, 255),
             font=font,
-            spacing=spacing
+            spacing=spacing,
+            stroke_width=2,
+            stroke_fill=(0, 0, 0, 255)
         )
 
     out = io.BytesIO()
