@@ -1,87 +1,60 @@
 """
-Cloud Vision + Translation micro‑service (Compose‑only build, Caddy proxy, API‑key protected)
-==========================================================================================
+Cloud Vision + Translation micro‑service (Compose‑only build, client‑supplied API‑key)
+===================================================================================
 
-No standalone **Dockerfile**—everything is orchestrated directly in **docker‑compose.yml** using an official Python image.
+**Change:** The client must now include `X-API-KEY: <password>` (or `?key=`) with every request—Caddy no longer injects it automatically. The 401 guard in `translate_app.py` remains unchanged.
 
-Repo tree:
+Repo tree (unchanged):
 ```
-translator/               # ← new folder (keeps app code)
-├── translate_app.py      # Flask app with Vision → Translation chain
+translator/
+├── translate_app.py      # Flask app with Vision → Translation chain (+401 auth)
 └── requirements.txt      # Python deps
-Caddyfile                 # add site block below
+Caddyfile                 # updated site block below
 key.json                  # GCP service‑account key (git‑ignored)
-docker-compose.yml        # updated, now builds translator inline
+docker-compose.yml        # compose‑only build for translator
 .env                      # PROJECT_ID and API_PASSWORD
 ```
 
 ---
 
-## docker-compose.yml (merge into your current file)
+## docker-compose.yml additions
+*(merge into your existing file — unchanged from the previous step, shown here for reference)*
 ```yaml
 version: "3.9"
 services:
-
-  # --- existing services (db, n8n, planka, caddy, ollama, webui, …) ---
-
   translator:
-    image: python:3.11-slim               # no custom Dockerfile
+    image: python:3.11-slim
     container_name: translator
     restart: unless-stopped
     working_dir: /app
     volumes:
-      - ./translator:/app                 # code & requirements.txt
-      - ./key.json:/secrets/key.json:ro   # GCP creds (read‑only)
+      - ./translator:/app
+      - ./key.json:/secrets/key.json:ro
     environment:
       PROJECT_ID: ${PROJECT_ID}
       API_PASSWORD: ${API_PASSWORD}
       GOOGLE_APPLICATION_CREDENTIALS: /secrets/key.json
-    # Install libs then launch gunicorn every time the container starts.
     command: >
       sh -c "apt-get update -qq && \
              apt-get install -y --no-install-recommends libjpeg62-turbo libfreetype6 && \
              pip install --no-cache-dir -r requirements.txt && \
              gunicorn -w 4 -b 0.0.0.0:8080 translate_app:app"
     networks: [internal]
-    # Internal only; Caddy handles HTTPS exposure.
+    # Internal only; remove host exposure if you like.
     ports:
       - "127.0.0.1:8080:8080"
-
-  caddy:
-    # … keep existing fields …
-    depends_on:
-      - n8n
-      - planka
-      - translator          # ← add translator so Caddy waits for it
-
-networks:
-  internal:
-    driver: bridge
-```
-
-### requirements.txt (translator/requirements.txt)
-```
-Flask==3.0.*
-gunicorn==22.*
-google-cloud-vision>=3.9.0
-google-cloud-translate>=3.12.4
-pillow>=10.0.0
 ```
 
 ---
 
-## Caddyfile (append this block)
+## Caddyfile – new site block
 ```caddyfile
 translate.aaroncollins.info {
-    reverse_proxy translator:8080 {
-        # Inject API key upstream so clients don’t need it
-        header_up X-API-KEY {env.API_PASSWORD}
-    }
-
+    reverse_proxy translator:8080    # No header injection – clients must send X-API-KEY themselves
     encode gzip
 }
 ```
-> **Note:** If you want the same Basic‑Auth gate you use elsewhere, wrap the route in `basicauth` like your other site blocks.
+*If you need Basic‑Auth as well, wrap the block with `basicauth` just like your other sub‑domains.*
 
 ---
 
@@ -93,8 +66,21 @@ API_PASSWORD=super-secret-pass
 
 ---
 
+### Calling the API (example)
+```bash
+curl -X POST \
+     -H "X-API-KEY: super-secret-pass" \
+     -F "file=@page.jpg" \
+     -F "target=en" \
+     https://translate.aaroncollins.info/translate-image | jq .translated_text
+```
+
+The Flask app still exposes `/healthz` without auth.
+
+---
+
 ## translator/translate_app.py (unchanged)
-[full code below]
+[full code preserved below]
 """
 
 import os
@@ -127,15 +113,13 @@ translate_client = translate.TranslationServiceClient()
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Auth guard
+# Auth guard (401 if key missing or wrong)
 # ---------------------------------------------------------------------------
 
 @app.before_request
 def enforce_api_key():
-    """Reject any call without a matching X-API-KEY header (except /healthz)."""
-    if request.path == "/healthz":
-        return  # allow unauthenticated health checks
-
+    if request.path == "/healthz":  # allow unauthenticated health checks
+        return
     client_key = request.headers.get("X-API-KEY") or request.args.get("key")
     if not client_key or not secrets.compare_digest(client_key, API_PASSWORD):
         abort(401, description="Unauthorized – missing or invalid API key")
@@ -205,7 +189,7 @@ def translate_image():
     # 2) Translate
     translated_text = translate_text(full_text, target)
 
-    # 3) Quick overlay PNG
+    # 3) Overlay PNG
     translated_png = burn_in_translation(img_bytes, translated_text)
     b64_png = base64.b64encode(translated_png).decode()
 
