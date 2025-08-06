@@ -147,15 +147,84 @@ def ocr_image(img_bytes: bytes):
     return response
 
 
-def burn_in_translation(img_bytes: bytes, translation: str) -> bytes:
+def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> bytes:
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     draw = ImageDraw.Draw(img, "RGBA")
 
-    banner_height = max(40, img.height // 15)
-    draw.rectangle([(0, 0), (img.width, banner_height)], fill=(0, 0, 0, 180))
+    # Use local bold font bundled with the app
+    preferred_font_path = os.path.join(os.path.dirname(__file__), "fonts", "DejaVuSans-Bold.ttf")
+    base_font_size = 24
 
-    font = ImageFont.load_default()
-    draw.text((10, 10), translation, fill=(255, 255, 255, 255), font=font)
+    # Helper: Try to load the TTF font, fallback if missing/broken
+    def load_font(size: int):
+        if os.path.isfile(preferred_font_path):
+            try:
+                return ImageFont.truetype(preferred_font_path, size)
+            except Exception as e:
+                print(f"Font load failed: {e}")
+        return ImageFont.load_default()
+
+    for page in ocr_annotation.pages:
+        for block in page.blocks:
+            for paragraph in block.paragraphs:
+                full_text = ""
+                bbox_coords = []
+
+                for word in paragraph.words:
+                    word_text = "".join([s.text for s in word.symbols])
+                    full_text += word_text + " "
+                    box_vertices = word.bounding_box.vertices
+                    if len(box_vertices) == 4:
+                        x0, y0 = box_vertices[0].x, box_vertices[0].y
+                        x2, y2 = box_vertices[2].x, box_vertices[2].y
+                        # Skip vertical or rotated
+                        if abs(y2 - y0) > abs(x2 - x0):
+                            continue
+                        bbox_coords.append((x0, y0, x2, y2))
+
+                full_text = full_text.strip()
+                if not full_text or not bbox_coords:
+                    continue
+
+                try:
+                    translated = translate_text(full_text, target_lang)
+                except Exception:
+                    translated = "[translation error]"
+
+                # Get bounding box for paragraph
+                min_x = min(x0 for x0, _, _, _ in bbox_coords)
+                min_y = min(y0 for _, y0, _, _ in bbox_coords)
+                max_x = max(x2 for _, _, x2, _ in bbox_coords)
+                max_y = max(y2 for _, _, _, y2 in bbox_coords)
+
+                box_width = max_x - min_x
+                box_height = max_y - min_y
+
+                # Dynamically shrink font to fit
+                font_size = base_font_size
+                while font_size > 8:
+                    font = load_font(font_size)
+                    wrap_width = max(1, box_width // max(1, font_size // 2))
+                    wrapped = textwrap.fill(translated, width=wrap_width)
+                    text_w, text_h = draw.multiline_textsize(wrapped, font=font)
+                    if text_w <= box_width and text_h <= box_height:
+                        break
+                    font_size -= 1
+                else:
+                    font = load_font(10)
+                    wrapped = textwrap.fill(translated, width=box_width // 5)
+
+                # Draw translucent background
+                draw.rectangle([(min_x, min_y), (max_x, max_y)], fill=(0, 0, 0, 180))
+
+                # Overlay text
+                draw.multiline_text(
+                    (min_x + 4, min_y + 2),
+                    wrapped,
+                    fill=(255, 255, 255, 255),
+                    font=font,
+                    spacing=2
+                )
 
     out = io.BytesIO()
     img.save(out, format="PNG")
@@ -186,11 +255,11 @@ def translate_image():
         ocr_resp.text_annotations[0].locale if ocr_resp.text_annotations else "und"
     )
 
-    # 2) Translate
+    # 2) Translate full text for JSON return (optional)
     translated_text = translate_text(full_text, target)
 
-    # 3) Overlay PNG
-    translated_png = burn_in_translation(img_bytes, translated_text)
+    # 3) Translate and burn-in each box
+    translated_png = burn_in_translation(img_bytes, ocr_resp.full_text_annotation, target)
     b64_png = base64.b64encode(translated_png).decode()
 
     return jsonify(
