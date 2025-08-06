@@ -208,7 +208,10 @@ def burn_in_translation(img_bytes: bytes, ocr_annotation, target_lang: str) -> b
                     font = load_font(font_size)
                     wrap_width = max(1, box_width // max(1, font_size // 2))
                     wrapped = textwrap.fill(translated, width=wrap_width)
-                    text_w, text_h = draw.multiline_textsize(wrapped, font=font)
+                    bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=2)
+                    text_w = bbox[2] - bbox[0]
+                    text_h = bbox[3] - bbox[1]
+
                     if text_w <= box_width and text_h <= box_height:
                         break
                     font_size -= 1
