@@ -38,7 +38,7 @@ services:
       sh -c "apt-get update -qq && \
              apt-get install -y --no-install-recommends libjpeg62-turbo libfreetype6 && \
              pip install --no-cache-dir -r requirements.txt && \
-             gunicorn -w 4 -b 0.0.0.0:9000 translate_app:app"
+             gunicorn -w 4 -b 0.0.0.0:9000 translate_api:app"
     networks: [internal]
     # Internal only; remove host exposure if you like.
     ports:
