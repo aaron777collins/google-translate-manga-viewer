@@ -275,7 +275,7 @@ class ScreenTranslatorApp:
         else:
             print("No translated images obtained.")
 
-    def translate_via_api(self, pil_image, target="en"):
+    def translate_via_api(self, pil_image, target="en", timeout=30):
         """Send PIL image to translator API and get back a PIL image."""
         if not self.api_password:
             raise RuntimeError("API password not set")
@@ -289,14 +289,14 @@ class ScreenTranslatorApp:
             headers={"X-API-KEY": self.api_password},
             files={"file": ("page.png", buf.getvalue(), "image/png")},
             data={"target": target},
-            timeout=90,
+            timeout=timeout,
         )
 
         resp.raise_for_status()
         b64_png = resp.json()["translated_image"].split(",", 1)[1]
         return Image.open(BytesIO(base64.b64decode(b64_png)))
 
-    def process_translation_for_image(self, image_path):
+    def process_translation_for_image(self, image_path, timeout=30):
         """
         Mimics your translation flow:
          - Loads the image,
@@ -311,7 +311,7 @@ class ScreenTranslatorApp:
 
             if self.use_api:
                 # ── NEW: call micro-service ───────────────────────────────
-                translated_img = self.translate_via_api(img)
+                translated_img = self.translate_via_api(img, timeout=timeout)
                 return translated_img
 
             imgtk = ImageTk.PhotoImage(img)
