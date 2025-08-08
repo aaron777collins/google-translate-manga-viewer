@@ -1,640 +1,593 @@
-import tkinter as tk
-from tkinter import ttk, filedialog, simpledialog, messagebox
-import cv2
-import pyautogui
-import pygetwindow as gw
-from PIL import Image, ImageTk, ImageGrab
-import numpy as np
-import threading
-import time
-import os
-import win32clipboard
-from io import BytesIO
-import glob
-import logging
-import requests
-from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import base64
-from io import BytesIO
-import requests
+import io
+import os
+import re
+import sys
+import time
+import zipfile
+import uuid
+import json
+import threading
+from threading import Lock
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List, Tuple, Optional, Protocol
+from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-class ScreenTranslatorApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Screen Translator")
+from flask import Flask, request, jsonify, send_file, render_template
+from dotenv import load_dotenv
+import requests
+from bs4 import BeautifulSoup
+from PIL import Image
+from io import BytesIO
 
-        load_dotenv()
-        self.api_password = os.getenv("API_PASSWORD")
-        self.api_url      = os.getenv("API_URL") \
-                    or "https://translate.aaroncollins.info/translate-image"
+# -----------------------------
+# Config / App
+# -----------------------------
 
-        mode = tk.simpledialog.askstring(
-            "Translation mode",
-            "Type 'api' to use Translator API\nor 'scrape' to drive browser:",
-        )
+load_dotenv()
+API_PASSWORD = os.getenv("API_PASSWORD")
+API_URL = os.getenv("API_URL") or "https://translate.aaroncollins.info/translate-image"
+JOBS_DIR = Path(os.getenv("JOB_DIR", "./jobs"))
+JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
-        self.use_api = (mode or "").strip().lower() == "api"
+if not API_PASSWORD:
+    print("ERROR: API_PASSWORD is not set (env or .env).", file=sys.stderr)
 
-        if self.use_api:
-            if not self.api_password:
-                # ask for password only if .env didn’t provide it
-                self.api_password = tk.simpledialog.askstring(
-                    "API password",
-                    "Enter X-API-KEY password:",
-                    show="*",
-                )
-            if not self.api_url:
-                # same for the URL
-                self.api_url = tk.simpledialog.askstring(
-                    "API URL",
-                    "Enter full https URL for translator:",
-                    initialvalue="https://translate.aaroncollins.info/translate-image",
-                )
+app = Flask(__name__)
 
-        self.running = False
+# -----------------------------
+# Locks per job (status.json safety)
+# -----------------------------
 
-        # Prompt user to select download folder
-        self.select_download_folder()
+STATUS_LOCKS: dict[str, Lock] = {}
 
-        self.create_widgets()
+def _get_lock(job_id: str) -> Lock:
+    if job_id not in STATUS_LOCKS:
+        STATUS_LOCKS[job_id] = Lock()
+    return STATUS_LOCKS[job_id]
 
-        self.live_feed_window = tk.Toplevel(self.root)
-        self.live_feed_window.title("Live Feed")
-        self.live_feed_label = tk.Label(self.live_feed_window)
-        self.live_feed_label.pack()
+# -----------------------------
+# Utilities
+# -----------------------------
 
-        self.translated_feed_window = tk.Toplevel(self.root)
-        self.translated_feed_window.title("Translated Feed")
-        self.translated_feed_label = tk.Label(self.translated_feed_window)
-        self.translated_feed_label.pack()
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
-    def scrape_chapter(self):
-        url = simpledialog.askstring("Chapter URL", "Enter a chapter URL:")
-        if not url:
-            return
+def sanitize_id(s: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9._-]+", "_", s)
 
-        hostname = urlparse(url).netloc.lower()
-        if "mangadex.org" in hostname:
-            return self.scrape_mangadex(url)
-        elif "rawkuma.net" in hostname:
-            return self.scrape_rawkuma(url)
-        else:
-            messagebox.showerror("Unsupported site",
-                                   f"Sorry, I don't know how to scrape {hostname}")
-            
-    def _scrape_rawkuma_worker(self, url):
-        print(f"[Thread] Running rawkuma scrape in thread: {threading.current_thread().name}")
+def per_url_dir(base_dir: Path, url: str) -> Path:
+    host = urlparse(url).netloc.replace(":", "_").lower()
+    path_parts = [p for p in urlparse(url).path.split("/") if p]
+    id_part = None
+    if "mangadex.org" in host and len(path_parts) >= 5 and path_parts[3] == "chapter":
+        id_part = path_parts[4]
+    elif path_parts:
+        id_part = path_parts[-1]
+    safe = sanitize_id(id_part or str(int(time.time())))
+    out = base_dir / f"{host}_{safe}"
+    out.mkdir(parents=True, exist_ok=True)
+    return out
 
+def read_urls_from_text(s: str) -> List[str]:
+    return [line.strip() for line in s.splitlines() if line.strip()]
+
+_index_re = re.compile(r"(\d{3,})")
+
+def extract_index_from_name(name: str) -> int:
+    m = _index_re.search(name)
+    if m:
         try:
-            resp = requests.get(url)
-            resp.raise_for_status()
-        except Exception as e:
-            print("Error fetching RawKuma page:", e)
-            return
+            return int(m.group(1))
+        except Exception:
+            pass
+    digits = re.findall(r"\d+", name)
+    if digits:
+        try:
+            return int(digits[-1])
+        except Exception:
+            pass
+    return 10**9
 
+def stitch_vertically(pil_images: List[Image.Image]) -> Image.Image:
+    widths = [im.width for im in pil_images]
+    heights = [im.height for im in pil_images]
+    max_w = max(widths) if widths else 1
+    total_h = sum(heights) if heights else 1
+    canvas = Image.new("RGB", (max_w, total_h), "white")
+    y = 0
+    for im in pil_images:
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        canvas.paste(im, (0, y))
+        y += im.height
+    return canvas
+
+# -----------------------------
+# Strategy interfaces
+# -----------------------------
+
+class ScraperStrategy(Protocol):
+    def supports(self, url: str) -> bool: ...
+    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]: ...
+
+class RawKumaScraper:
+    def supports(self, url: str) -> bool:
+        return "rawkuma" in urlparse(url).netloc.lower()
+
+    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+        log(f"[RawKuma] GET {url}")
+        resp = session.get(url, timeout=30)
+        resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         reader = soup.find("div", id="readerarea")
         if not reader:
-            print("No readerarea on page!")
-            return
-
-        imgs = reader.find_all("img", attrs={"data-index": True})
-        if imgs:
-            imgs.sort(key=lambda t: int(t["data-index"]))
-        else:
-            print("No <img data-index> tags found; falling back to all <img> tags")
-            imgs = [
-                img for img in reader.find_all("img")
-                if (img.get("data-src") or img.get("src"))
-                and "placeholder" not in (img.get("src") or "")
-            ]
-
-        downloaded = []
-        for fallback_idx, tag in enumerate(imgs):
+            return []
+        imgs = reader.find_all("img", attrs={"data-index": True}) or [
+            img for img in reader.find_all("img")
+            if (img.get("data-src") or img.get("src")) and "placeholder" not in (img.get("src") or "")
+        ]
+        paths: List[Path] = []
+        for idx, tag in enumerate(imgs):
             src = tag.get("data-src") or tag.get("src")
-            if tag.get("data-index") and tag["data-index"].isdigit():
-                page_num = int(tag["data-index"]) + 1
-            else:
-                page_num = fallback_idx + 1
+            page_num = int(tag.get("data-index") or idx) + 1
             fname = f"rawkuma_{page_num:03d}.png"
-            out_path = os.path.join(self.download_folder or ".", fname)
+            out_path = out_dir / fname
+            img_url = urljoin(url, src)
             try:
-                r = requests.get(urljoin(url, src))
+                r = session.get(img_url, timeout=45)
                 r.raise_for_status()
-                with open(out_path, "wb") as f:
-                    f.write(r.content)
-                downloaded.append(out_path)
-                print(f"Downloaded {out_path}")
+                out_path.write_bytes(r.content)
+                paths.append(out_path)
             except Exception as e:
-                print(f"Error downloading {src}: {e}")
+                log(f"[RawKuma] ERROR downloading {img_url}: {e}")
+        return paths
 
-        def translate_and_save_rawkuma(index, img_path, max_retries=3, timeout=30):
-            for attempt in range(max_retries):
-                try:
-                    translated_img = self.process_translation_for_image(img_path, timeout=timeout)
-                    if not translated_img:
-                        raise Exception("Translation returned None")
+class MangaDexScraper:
+    def supports(self, url: str) -> bool:
+        return "mangadex.org" in urlparse(url).netloc.lower()
 
-                    individual_name = f"translated_rawkuma_{index:03d}.png"
-                    individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
-                    translated_img.save(individual_path)
-                    print(f"Saved translated page: {individual_path}")
-
-                    if self.enableRotate.get():
-                        rotated = translated_img.transpose(Image.ROTATE_90)
-                        rotated_path = individual_path.replace(".png", ".rotated.png")
-                        rotated.save(rotated_path)
-                        print(f"Saved rotated page:  {rotated_path}")
-
-                    return (index, translated_img.copy())
-                except Exception as e:
-                    print(f"[Retry {attempt+1}/{max_retries}] Error translating image {img_path}: {e}")
-                    time.sleep(2 ** attempt)
-
-            print(f"[FAILED] Max retries exceeded for image {img_path}")
-            return (index, None)
-
-        translated = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(translate_and_save_rawkuma, idx + 1, path)
-                    for idx, path in enumerate(downloaded)]
-            for future in as_completed(futures):
-                try:
-                    idx, result = future.result()
-                    if result:
-                        translated.append((idx, result))
-                except Exception as e:
-                    print(f"❌ Future failed: {e}")
-
-        translated.sort(key=lambda x: x[0])
-        translated_images = [img for _, img in translated]
-
-        if translated_images:
-            stitched = self.stitch_images_vertically(translated_images)
-            print("🧵 Stitching complete.")
-
-            # Schedule display & save on main thread
-            def show_and_save():
-                self.show_stitched_image(stitched)
-                final = os.path.normpath(
-                    os.path.join(self.download_folder or ".", f"translated_rawkuma_{int(time.time())}.png")
-                )
-                stitched.save(final)
-                print("✅ Saved final:", final)
-
-            self.root.after(0, show_and_save)
-        else:
-            print("No translated images obtained.")
-
-    def scrape_rawkuma(self, url):
-        print(f"[MainThread] Starting background scrape of {url}")
-        threading.Thread(target=self._scrape_rawkuma_worker, args=(url,), daemon=True).start()
-
-    # --- New method using the API to download a chapter and process translation ---
-    def _scrape_mangadex_worker(self, url):
-        print(f"[Thread] Running mangadex scrape in thread: {threading.current_thread().name}")
-
+    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+        parts = [p for p in url.strip().split("/") if p]
         try:
-            parts = url.strip().split('/')
-            chapter_id = parts[4]
-            print(f"Extracted chapter id: {chapter_id}")
-        except Exception as e:
-            print("Error parsing URL:", e)
-            return
-
-        api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}?forcePort443=false"
-        try:
-            response = requests.get(api_url)
-            response.raise_for_status()
-            data = response.json()
-            if data.get("result") != "ok":
-                print("API response not OK")
-                return
-        except Exception as e:
-            print("Error calling Mangadex API:", e)
-            return
-
-        base_url = data["baseUrl"]
-        chapter = data["chapter"]
-        hash_val = chapter["hash"]
-        pages = chapter["data"]
-
-        downloaded_files = []
-        for i, filename in enumerate(pages):
-            image_url = f"{base_url}/data/{hash_val}/{filename}"
+            idx = parts.index("chapter")
+            chapter_id = parts[idx + 1]
+        except Exception:
             try:
-                img_response = requests.get(image_url)
-                img_response.raise_for_status()
-                file_path = os.path.join(self.download_folder or ".", f"chapter_{chapter_id}_{i+1:03d}.png")
-                with open(file_path, "wb") as f:
-                    f.write(img_response.content)
-                downloaded_files.append(file_path)
-                print(f"Downloaded {file_path}")
+                chapter_id = parts[4]
             except Exception as e:
-                print(f"Error downloading {image_url}: {e}")
+                log(f"[MangaDex] ERROR parsing chapter id: {e}")
+                return []
+        api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}?forcePort443=false"
+        r = session.get(api_url, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("result") != "ok":
+            return []
+        base_url = data["baseUrl"]
+        ch = data["chapter"]
+        hash_val = ch["hash"]
+        pages = ch["data"]
+        paths: List[Path] = []
+        for i, filename in enumerate(pages):
+            img_url = f"{base_url}/data/{hash_val}/{filename}"
+            try:
+                img_resp = session.get(img_url, timeout=60)
+                img_resp.raise_for_status()
+                file_path = out_dir / f"chapter_{chapter_id}_{i+1:03d}.png"
+                file_path.write_bytes(img_resp.content)
+                paths.append(file_path)
+            except Exception as e:
+                log(f"[MangaDex] ERROR downloading {img_url}: {e}")
+        return paths
 
-        def translate_and_save_mangadex(index, file_path, max_retries=3, timeout=30):
-            for attempt in range(max_retries):
-                try:
-                    translated_img = self.process_translation_for_image(file_path, timeout=timeout)
-                    if not translated_img:
-                        raise Exception("Translation returned None")
+# -----------------------------
+# Translator API
+# -----------------------------
 
-                    individual_name = f"translated_{chapter_id}_{index:03d}.png"
-                    individual_path = os.path.normpath(os.path.join(self.download_folder or ".", individual_name))
-                    translated_img.save(individual_path)
-                    print(f"Saved translated page: {individual_path}")
+@dataclass
+class TranslatorAPI:
+    api_url: str
+    api_key: str
+    target_lang: str = "en"
+    timeout: int = 60
+    max_retries: int = 3
+    backoff_base: float = 1.5
 
-                    return (index, translated_img.copy())  # <- copy ensures safe image reuse
-                except Exception as e:
-                    print(f"[Retry {attempt+1}/{max_retries}] Error translating image {file_path}: {e}")
-                    time.sleep(2 ** attempt)
-
-            print(f"[FAILED] Max retries exceeded for image {file_path}")
-            return (index, None)
-
-        translated = []
-        with ThreadPoolExecutor(max_workers=8) as executor:
-            futures = [executor.submit(translate_and_save_mangadex, idx + 1, path)
-                    for idx, path in enumerate(downloaded_files)]
-            for future in as_completed(futures):
-                try:
-                    idx, img = future.result()
-                    if img:
-                        translated.append((idx, img))
-                except Exception as e:
-                    print(f"❌ Future failed: {e}")
-
-        translated.sort(key=lambda x: x[0])
-        translated_images = [img for _, img in translated]
-
-        if translated_images:
-            stitched_image = self.stitch_images_vertically(translated_images)
-            print("🧵 Stitching complete.")
-
-            def show_and_save():
-                self.show_stitched_image(stitched_image)
-                final_path = os.path.normpath(os.path.join(self.download_folder or ".", f"translated_manga_{chapter_id}_{int(time.time())}.png"))
-                stitched_image.save(final_path)
-                print(f"✅ Final manga saved as: {final_path}")
-
-            self.root.after(0, show_and_save)
-        else:
-            print("No translated images obtained.")
-
-    def scrape_mangadex(self, url):
-        print(f"[MainThread] Starting background scrape of {url}")
-        threading.Thread(target=self._scrape_mangadex_worker, args=(url,), daemon=True).start()
-
-    def translate_via_api(self, pil_image, target="en", timeout=30):
-        """Send PIL image to translator API and get back a PIL image."""
-        if not self.api_password:
-            raise RuntimeError("API password not set")
-
-        buf = BytesIO()
-        pil_image.save(buf, format="PNG")
-        buf.seek(0)
-
-        resp = requests.post(
-            self.api_url,
-            headers={"X-API-KEY": self.api_password},
-            files={"file": ("page.png", buf.getvalue(), "image/png")},
-            data={"target": target},
-            timeout=timeout,
-        )
-
-        resp.raise_for_status()
-        b64_png = resp.json()["translated_image"].split(",", 1)[1]
-        return Image.open(BytesIO(base64.b64decode(b64_png)))
-
-    def process_translation_for_image(self, image_path, timeout=30):
-        """
-        Mimics your translation flow:
-         - Loads the image,
-         - Updates the live feed,
-         - Copies the image to the clipboard,
-         - Initiates the OCR/translation process,
-         - Waits for the translated image and returns it.
-        """
-        try:
-            img = Image.open(image_path)
-            # Display image on the live feed (simulate a capture)
-
-            if self.use_api:
-                # ── NEW: call micro-service ───────────────────────────────
-                translated_img = self.translate_via_api(img, timeout=timeout)
-                return translated_img
-
-            imgtk = ImageTk.PhotoImage(img)
-            self.live_feed_label.imgtk = imgtk
-            self.live_feed_label.configure(image=imgtk)
-            self.root.update()
-
-            # Copy image to clipboard and invoke translation
-            self.copy_image_to_clipboard(img)
-            self.upload_image_to_ocr()
-            # Wait and retrieve the translated image
-            translated_img = self.wait_for_translated_image()
-            return translated_img
-        except Exception as e:
-            print(f"Error translating {image_path}: {e}")
-            return None
-
-    def wait_for_translated_image(self, max_tries=5, retry_interval=1000):
-        import glob
-        tries = 0
-        while tries < max_tries:
-            pattern = os.path.join(self.download_folder, "translated_image_en*.png") if self.download_folder else "translated_image_en*.png"
-            image_files = glob.glob(pattern)
-            if image_files:
-                image_path = image_files[0]
-                print(f"Translated image found: {image_path}")
-                # Use a context manager to open and copy the image, then close it.
-                with Image.open(image_path) as img:
-                    img_copy = img.copy()
-                os.remove(image_path)  # Now that the file is closed, it can be removed.
-                return img_copy
-            else:
-                tries += 1
-                print(f"Waiting for translated image... {tries}/{max_tries}")
-                time.sleep(retry_interval / 1000.0)
-        print("Translated image not found after maximum retries.")
+    def translate_image(self, image_bytes: bytes) -> Optional[bytes]:
+        for attempt in range(self.max_retries):
+            try:
+                files = {"file": ("page.png", image_bytes, "image/png")}
+                data = {"target": self.target_lang}
+                headers = {"X-API-KEY": self.api_key}
+                resp = requests.post(self.api_url, headers=headers, files=files, data=data, timeout=self.timeout)
+                resp.raise_for_status()
+                b64_png = resp.json()["translated_image"].split(",", 1)[1]
+                return base64.b64decode(b64_png)
+            except Exception:
+                time.sleep(self.backoff_base ** attempt)
         return None
 
-    def stitch_images_vertically(self, images):
-        """
-        Stitches a list of PIL Image objects vertically.
-        """
-        widths = [img.width for img in images]
-        heights = [img.height for img in images]
-        max_width = max(widths)
-        total_height = sum(heights)
-        stitched = Image.new("RGB", (max_width, total_height), "white")
-        y_offset = 0
-        for img in images:
-            stitched.paste(img, (0, y_offset))
-            y_offset += img.height
-        return stitched
+# -----------------------------
+# Job Runner with Status Tracking
+# -----------------------------
 
-    def show_stitched_image(self, image):
-        """
-        Displays the stitched manga image in a new window with a vertical scrollbar.
-        """
-        win = tk.Toplevel(self.root)
-        win.title("Translated Manga")
-        canvas = tk.Canvas(win)
-        scrollbar = tk.Scrollbar(win, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-        imgtk = ImageTk.PhotoImage(image)
-        canvas.create_image(0, 0, anchor="nw", image=imgtk)
-        canvas.imgtk = imgtk  # Keep a reference to avoid garbage collection
-        canvas.config(scrollregion=canvas.bbox("all"))
+@dataclass
+class JobConfig:
+    out_base: Path
+    pages_workers: int
+    rotate_90: bool = False
+    target_lang: str = "en"
+    timeout: int = 60
+    retries: int = 3
 
-    def copy_image_to_clipboard(self, image):
-        """
-        Copy an image to the Windows clipboard.
-        """
-        from io import BytesIO
-        import win32clipboard
-        output = BytesIO()
-        image.convert('RGB').save(output, 'BMP')
-        data = output.getvalue()[14:]
-        output.close()
+def update_status(job_id, **kwargs):
+    status_file = JOBS_DIR / job_id / "status.json"
+    lock = _get_lock(job_id)
+    with lock:
+        status = {}
+        if status_file.exists():
+            status = json.loads(status_file.read_text())
 
-        win32clipboard.OpenClipboard()
-        win32clipboard.EmptyClipboard()
-        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)
-        win32clipboard.CloseClipboard()
-
-    def create_widgets(self):
-        self.window_list = ttk.Combobox(self.root, postcommand=self.preview_window)
-        self.window_list.grid(row=0, column=0, padx=10, pady=10)
-
-        # Speed control slider
-        self.speed_var = tk.DoubleVar()
-        self.speed_var.set(5.0)  # Default speed is set to 5 second
-        self.speed_slider = tk.Scale(self.root, from_=0.1, to=15.0, resolution=0.1,
-                                     orient='horizontal', label='Update Speed (s)',
-                                     variable=self.speed_var)
-        self.speed_slider.grid(row=2, column=0, columnspan=3, sticky='ew', padx=10, pady=10)
-
-        self.start_button = ttk.Button(self.root, text="Start", command=self.start_translation)
-        self.start_button.grid(row=1, column=0, padx=10, pady=10)
-        self.stop_button = ttk.Button(self.root, text="Stop", command=self.stop_translation)
-        self.stop_button.grid(row=1, column=1, padx=10, pady=10)
-
-        self.translate_button = ttk.Button(self.root, text="Translate", command=self.manual_translate)
-        self.translate_button.grid(row=1, column=2, padx=10, pady=10)  # Adjust column as needed
-
-         # New button to scrape website chapter via API
-        self.scrape_button = ttk.Button(self.root, text="Scrape URL (mangadex or rawkuma)", command=self.scrape_chapter)
-        self.scrape_button.grid(row=1, column=3, padx=10, pady=10)
-
-        self.enableRotate = tk.IntVar()
-        self.rotate_toggle = ttk.Checkbutton(self.root, text="Rotate Image", variable=self.enableRotate, 
-                                             onvalue=1, offvalue=0, command=self.on_rotate_toggle)
-        self.rotate_toggle.grid(row=1, column=4, padx=10, pady=10)
-
-        self.refresh_window_list()
-
-    def on_rotate_toggle(self):
-        if self.enableRotate.get() == 1:
-            print("Enabled rotate image")
-        else:
-            print("Disabled rotate image")
-
-    def select_download_folder(self):
-        self.download_folder = filedialog.askdirectory(title="Select Folder for Downloaded Translations")
-        if not self.download_folder:  # In case the user cancels the selection
-            self.download_folder = None
-            print("No folder selected, defaulting to current directory for downloads.")
-        else:
-            print(f"Download folder set to: {self.download_folder}")
-
-    def display_and_delete_translated_image(self, max_tries=5, retry_interval=1000):
-        # Use a list to hold the state across retries
-        retry_state = {'tries': 0}
-
-        def try_display_image():
-            nonlocal max_tries  # Ensure we can access and modify max_tries
-            pattern = os.path.join(self.download_folder, "translated_image_en*.png") if self.download_folder else "translated_image_en*.png"
-            image_files = glob.glob(pattern)
-
-            if image_files:
-                image_path = image_files[0]
-                print(f"Displaying image: {image_path}")
-
-                img = Image.open(image_path)
-                # Calculate the new size to fit the entire rotated image
-                original_width, original_height = img.size
-                diagonal_length = int((original_width ** 2 + original_height ** 2) ** 0.5)
-                new_size = (diagonal_length, diagonal_length)
-
-                # Create a new blank image with the new size and white background
-                new_img = Image.new("RGB", new_size, "white")
-                # Paste the original image into the center of the new blank image
-                new_img.paste(img, ((new_size[0] - original_width) // 2, (new_size[1] - original_height) // 2))
-
-                # Rotate the image by 45 degrees without cropping
-                rotated_img = new_img.rotate(45, expand=True) if self.enableRotate.get() else new_img
-
-                imgtk = ImageTk.PhotoImage(image=rotated_img)
-                self.translated_feed_label.imgtk = imgtk  # Keep a reference!
-                self.translated_feed_label.configure(image=imgtk)
-
-                # Delete the image file after displaying
-                os.remove(image_path)
-                print(f"Deleted image: {image_path}")
+        for key, value in kwargs.items():
+            if key == "jobs" and isinstance(value, dict):
+                status.setdefault("jobs", {})
+                # deep-merge per-URL dicts
+                for u, meta in value.items():
+                    if isinstance(meta, dict) and isinstance(status["jobs"].get(u), dict):
+                        status["jobs"][u].update(meta)
+                    else:
+                        status["jobs"][u] = meta
+            elif isinstance(value, dict) and isinstance(status.get(key), dict):
+                status[key].update(value)
             else:
-                retry_state['tries'] += 1
-                print(f"No translated image found to display. Retrying... {retry_state['tries']}/{max_tries}")
-                if retry_state['tries'] < max_tries:
-                    # Schedule another try
-                    self.root.after(retry_interval, try_display_image)
-                else:
-                    print("Failed to find translated image after maximum retries.")
+                status[key] = value
 
-        # Start the first attempt
-        self.root.after(0, try_display_image)
+        status_file.write_text(json.dumps(status, indent=2))
 
+def process_url(
+    url,
+    scrapers,
+    translator,
+    cfg,
+    session,
+    job_id=None
+):
+    out_dir = per_url_dir(cfg.out_base, url)
+    # record folder (relative) early for downloads
+    if job_id:
+        folder_rel = str(out_dir.relative_to(cfg.out_base))
+        update_status(job_id, jobs={url: {"folder": folder_rel}})
 
-    def refresh_window_list(self):
-        windows = gw.getAllTitles()
-        self.window_list['values'] = windows
+    strategy = next((s for s in scrapers if s.supports(url)), None)
+    if not strategy:
+        if job_id:
+            update_status(job_id, jobs={url: {"status": "failed", "error": "unsupported_host"}})
+        return
 
-    def manual_translate(self):
-        """Manually capture the screen and initiate the OCR process."""
-        self.capture_and_update_feed()
-        self.upload_image_to_ocr()
-        self.display_and_delete_translated_image()
+    try:
+        # Download pages
+        originals = strategy.download_pages(url, out_dir, session)
+        total_pages = len(originals)
 
-    def preview_window(self):
-        selected_title = self.window_list.get()
-        if selected_title:
-            try:
-                window = gw.getWindowsWithTitle(selected_title)[0]
-                if not window.isActive:
-                    window.activate()
-                preview = pyautogui.screenshot(region=(
-                    window.left, window.top, window.width, window.height))
-                preview = cv2.cvtColor(np.array(preview), cv2.COLOR_RGB2BGR)
-                preview = cv2.resize(preview, (320, 240))
-                img = Image.fromarray(preview)
-                imgtk = ImageTk.PhotoImage(image=img)
-                self.live_feed_label.imgtk = imgtk
-                self.live_feed_label.configure(image=imgtk)
-            except Exception as e:
-                print(f"Window activation failed: {e}")
+        # Initialize per-URL tracking
+        if job_id:
+            update_status(job_id, jobs={url: {"progress": 0, "total": total_pages, "status": "running", "folder": folder_rel}})
 
-    def start_translation(self):
-        self.running = True
-        threading.Thread(target=self.process_screen, daemon=True).start()
+        # No pages -> treat as failed (retryable)
+        if total_pages == 0:
+            if job_id:
+                status_file = JOBS_DIR / job_id / "status.json"
+                lock = _get_lock(job_id)
+                with lock:
+                    status = json.loads(status_file.read_text())
+                    status["jobs"].setdefault(url, {})
+                    status["jobs"][url].update({"status": "failed", "error": "no_pages"})
+                    status_file.write_text(json.dumps(status, indent=2))
+            return
 
-    def stop_translation(self):
-        self.running = False
+        def work(page_path):
+            index = extract_index_from_name(page_path.name)
+            img_bytes = page_path.read_bytes()
+            translated_bytes = translator.translate_image(img_bytes)
+            im = Image.open(BytesIO(translated_bytes or img_bytes)).copy()
+            if cfg.rotate_90:
+                im = im.transpose(Image.ROTATE_90)
+            im.convert("RGB").save(out_dir / f"translated_{index:03d}.png", "PNG")
+            return index, im
 
-    def process_screen(self):
-        while self.running:
-            self.capture_and_update_feed()
-            self.upload_image_to_ocr()
-            self.display_and_delete_translated_image()
-            time.sleep(self.speed_var.get())
+        completed_pages = 0
+        images_indexed = []
+        with ThreadPoolExecutor(max_workers=cfg.pages_workers) as ex:
+            for fut in as_completed([ex.submit(work, p) for p in originals]):
+                idx, im = fut.result()
+                images_indexed.append((idx, im))
+                completed_pages += 1
+                if job_id:
+                    status_file = JOBS_DIR / job_id / "status.json"
+                    lock = _get_lock(job_id)
+                    with lock:
+                        status = json.loads(status_file.read_text())
+                        status["jobs"][url]["progress"] = completed_pages
+                        status_file.write_text(json.dumps(status, indent=2))
 
-    def activate_window(self, title_contains):
-        """Maximize the window if it's not already maximized."""
-        windows = gw.getWindowsWithTitle(title_contains)
-        for window in windows:
-            if title_contains in window.title:
-                window.activate()
-                time.sleep(1)  # Give it a moment to maximize
-                break  # Assuming you only need to maximize the first matching window
+        # Save stitched image
+        images_indexed.sort(key=lambda t: t[0])
+        stitched = stitch_vertically([im for _, im in images_indexed])
+        stitched.save(out_dir / f"translated_final.png", "PNG")
 
+        # Mark URL job finished (SUCCESS) and increment overall URL count
+        if job_id:
+            status_file = JOBS_DIR / job_id / "status.json"
+            lock = _get_lock(job_id)
+            with lock:
+                status = json.loads(status_file.read_text())
+                status["jobs"][url]["status"] = "finished"
+                if "overall" in status and "progress" in status["overall"]:
+                    status["overall"]["progress"] += 1
+                status_file.write_text(json.dumps(status, indent=2))
 
-    def capture_and_update_feed(self):
-        selected_title = self.window_list.get()
-        if selected_title:
-            try:
-                window = gw.getWindowsWithTitle(selected_title)[0]
-                if not window.isActive:
-                    window.activate()
-                screenshot = pyautogui.screenshot(region=(
-                    window.left, window.top, window.width, window.height))
-                self.update_live_feed(screenshot)
-                self.copy_image_to_clipboard(screenshot)
-            except Exception as e:
-                print(f"Error during screen capture: {e}")
+    except Exception as e:
+        # Mark URL failed (so it’s retryable)
+        if job_id:
+            status_file = JOBS_DIR / job_id / "status.json"
+            lock = _get_lock(job_id)
+            with lock:
+                status = json.loads(status_file.read_text())
+                status.setdefault("jobs", {}).setdefault(url, {"progress": 0, "total": 0})
+                status["jobs"][url].update({"status": "failed", "error": str(e)})
+                status_file.write_text(json.dumps(status, indent=2))
+        return
 
-    def update_live_feed(self, image):
-        img = Image.fromarray(np.array(image))
-        imgtk = ImageTk.PhotoImage(image=img)
-        self.live_feed_label.imgtk = imgtk
-        self.live_feed_label.configure(image=imgtk)
+def run_translation_job(job_id, urls, batch_workers, page_workers, target_lang, rotate_90, timeout, retries):
+    job_root = JOBS_DIR / job_id
+    jobs_info = {u: {"progress": 0, "total": 0, "status": "queued"} for u in urls}
+    # overall = URL-based
+    update_status(job_id, status="running", overall={"progress": 0, "total": len(urls)}, jobs=jobs_info)
+    translator = TranslatorAPI(api_url=API_URL, api_key=API_PASSWORD, target_lang=target_lang, timeout=timeout, max_retries=retries)
+    strategies = [MangaDexScraper(), RawKumaScraper()]
+    cfg = JobConfig(out_base=job_root, pages_workers=page_workers, rotate_90=rotate_90, target_lang=target_lang, timeout=timeout, retries=retries)
 
-    def copy_image_to_clipboard(self, image):
-        """Copy an image to the Windows clipboard."""
-        output = BytesIO()
-        image.convert('RGB').save(output, 'BMP')
-        data = output.getvalue()[14:]  # The file header offest for BMP files is 14 bytes
-        output.close()
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
+        with ThreadPoolExecutor(max_workers=batch_workers) as ex:
+            for _ in as_completed([ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in urls]):
+                pass
 
-        win32clipboard.OpenClipboard()  # Open the clipboard
-        win32clipboard.EmptyClipboard()  # Clear the clipboard contents
-        win32clipboard.SetClipboardData(win32clipboard.CF_DIB, data)  # Set the clipboard data as DIB which is a Device Independent Bitmap
-        win32clipboard.CloseClipboard()  # Close the clipboard
+    # Build final zip when everything is finished
+    (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
+    update_status(job_id, status="finished")
 
-    def upload_image_to_ocr(self):
-        # original location of user cursor
-        self.activate_window("Google Translate")
-        original_x, original_y = pyautogui.position()
-        click_image("translateimages0.png")
-        # wait 5 seconds for the image to be uploaded
-        time.sleep(5)
-        click_image("translateimages1.png", max_tries=3, retry_interval=5)
-        click_image("translateimages2.png")
-        # move the cursor back to the original location
-        pyautogui.moveTo(original_x, original_y)
-        print(f"Moved cursor back to original location: ({original_x}, {original_y})")
+# -----------------------------
+# API Endpoints
+# -----------------------------
 
+@app.route("/api/start-translation", methods=["POST"])
+def start_translation():
+    data = request.get_json(force=True)
+    urls = [u.strip() for u in data.get("urls", []) if isinstance(u, str) and u.strip()]
+    if not urls:
+        return jsonify({"error": "No URLs provided"}), 400
+    job_id = str(uuid.uuid4())
+    (JOBS_DIR / job_id).mkdir(parents=True, exist_ok=True)
+    jobs_info = {u: {"progress": 0, "total": 0, "status": "queued"} for u in urls}
 
-def click_image(image_name, confidence=0.9, max_tries=3, retry_interval=1):
+    # set overall total up-front to avoid 0/0 flicker
+    update_status(job_id, status="queued", overall={"progress": 0, "total": len(urls)}, jobs=jobs_info)
 
-    current_confidence = confidence
-    tries = 0
-    while tries < max_tries:
-        image_path = os.path.join("images", image_name)
-        worked = False
-        current_confidence = confidence
-        while not worked and current_confidence >= 0.6:  # Lower threshold to 0.6 or adjust based on your testing
-            try:
-                x, y = pyautogui.locateCenterOnScreen(image_path, confidence=current_confidence)
-                # Perform an instant click at the located position
-                pyautogui.click(x, y)
-                worked = True
-            except pyautogui.ImageNotFoundException:
-                current_confidence -= 0.1  # Decrease confidence level and try again
-                print(f"Trying with reduced confidence: {current_confidence}")
-            except Exception as e:
-                print(f"Unexpected error: {e}")
-                break  # Exit loop on unexpected errors
+    threading.Thread(
+        target=run_translation_job,
+        args=(job_id, urls, data.get("batch_workers", 10), data.get("page_workers", 32),
+              data.get("target_lang", "en"), data.get("rotate_90", False),
+              data.get("timeout", 60), data.get("retries", 3)),
+        daemon=True
+    ).start()
+    return jsonify({"job_id": job_id})
 
-        if worked:
-            print(f"Clicked on image: {image_name}")
-            return worked
-        else:
-            tries += 1
-            print(f"Failed to locate image {image_path}. Retrying... {tries}/{max_tries}")
-            time.sleep(retry_interval)
+@app.route("/api/job-status/<job_id>")
+def job_status(job_id):
+    status_file = JOBS_DIR / job_id / "status.json"
+    if not status_file.exists():
+        return jsonify({"error": "Job not found"}), 404
+    lock = _get_lock(job_id)
+    with lock:
+        return jsonify(json.loads(status_file.read_text()))
 
-    return worked
+@app.route("/api/download/<job_id>")
+def download_result(job_id):
+    zip_path = JOBS_DIR / job_id / "result.zip"
+    if not zip_path.exists():
+        return jsonify({"error": "Result not ready"}), 404
+    return send_file(zip_path, as_attachment=True, download_name=f"{job_id}.zip")
 
+@app.route("/api/download-finished/<job_id>")
+def download_finished(job_id):
+    """Zip only finished URL folders so far."""
+    status_file = JOBS_DIR / job_id / "status.json"
+    job_root = JOBS_DIR / job_id
+    if not status_file.exists():
+        return jsonify({"error": "Job not found"}), 404
 
+    lock = _get_lock(job_id)
+    with lock:
+        status = json.loads(status_file.read_text())
+        jobs = status.get("jobs", {})
+
+    folders = []
+    for url, meta in jobs.items():
+        if meta.get("status") == "finished" and meta.get("folder"):
+            folder = job_root / meta["folder"]
+            if folder.exists():
+                folders.append(folder)
+
+    if not folders:
+        return jsonify({"error": "No finished URLs yet"}), 400
+
+    buf = zip_selected_paths(job_root, folders, exclude={"result.zip", "status.json"})
+    filename = f"{job_id}_finished_{int(time.time())}.zip"
+    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+
+@app.route("/api/download-one/<job_id>")
+def download_one(job_id):
+    """Zip just one URL folder:
+       Preferred:  /api/download-one/<job_id>?folder=<relative-folder>
+       Fallback:   /api/download-one/<job_id>?u=<url-encoded-url>
+    """
+    job_root = JOBS_DIR / job_id
+    status_file = job_root / "status.json"
+    if not status_file.exists():
+        return jsonify({"error": "Job not found"}), 404
+
+    folder_param = request.args.get("folder", "").strip()
+    url_param = request.args.get("u", "").strip()
+
+    # Load status once under lock
+    lock = _get_lock(job_id)
+    with lock:
+        status = json.loads(status_file.read_text())
+        jobs = status.get("jobs", {})
+
+    # Preferred: folder param
+    if folder_param:
+        target = (job_root / folder_param)
+        if target.exists() and target.is_dir():
+            buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
+            filename = f"{job_id}_one_{sanitize_id(folder_param)}.zip"
+            return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+        return jsonify({"error": "Folder not found"}), 404
+
+    # Fallback: try url param with a couple of normalizations
+    if url_param:
+        # exact
+        meta = jobs.get(url_param)
+        # try strip trailing slash
+        if not meta and url_param.endswith("/"):
+            meta = jobs.get(url_param[:-1])
+        # try add trailing slash
+        if not meta and not url_param.endswith("/"):
+            meta = jobs.get(url_param + "/")
+
+        if meta and meta.get("folder"):
+            target = job_root / meta["folder"]
+            if target.exists():
+                buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
+                filename = f"{job_id}_one_{sanitize_id(meta['folder'])}.zip"
+                return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+        return jsonify({"error": "URL not found in job"}), 404
+
+    return jsonify({"error": "Missing ?folder=<id> or ?u=<url>"}), 400
+
+@app.route("/api/retry-url/<job_id>", methods=["POST"])
+def retry_failed_urls(job_id):
+    """Retry failed URLs for a job. Optional JSON body: {"urls": ["...","..."]} to retry specific URLs."""
+    status_file = JOBS_DIR / job_id / "status.json"
+    job_root = JOBS_DIR / job_id
+    if not status_file.exists():
+        return jsonify({"error": "Job not found"}), 404
+
+    # read status once
+    lock = _get_lock(job_id)
+    with lock:
+        status = json.loads(status_file.read_text())
+        jobs = status.get("jobs", {}).copy()  # shallow copy ok
+
+    body = request.get_json(silent=True) or {}
+    requested = body.get("urls")
+
+    # allow retry of specified URLs if they exist & not currently running
+    def eligible(u, meta):
+        st = (meta or {}).get("status")
+        return st in ("failed", "skipped")  # extend if you want
+
+    if requested:
+        retry_urls = [u for u in requested if u in jobs and eligible(u, jobs[u])]
+    else:
+        retry_urls = [u for u, meta in jobs.items() if eligible(u, meta)]
+
+    if not retry_urls:
+        return jsonify({"message": "No failed URLs to retry"}), 200
+
+    # Prep runner bits
+    translator = TranslatorAPI(api_url=API_URL, api_key=API_PASSWORD)
+    strategies = [MangaDexScraper(), RawKumaScraper()]
+    cfg = JobConfig(out_base=job_root, pages_workers=int(os.getenv("PAGE_WORKERS", "32")))
+
+    # Mark retries as running (reset counters, KEEP folder)
+    for u in retry_urls:
+        prev = jobs.get(u, {}) or {}
+        update_status(
+            job_id,
+            jobs={
+                u: {
+                    "folder": prev.get("folder"),          # <- preserve
+                    "progress": 0,
+                    "total": prev.get("total", 0),
+                    "status": "running",
+                    "error": None                           # clear last error
+                }
+            }
+        )
+
+    # Run retries
+    with requests.Session() as session:
+        session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
+        with ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_WORKERS", "10"))) as ex:
+            futs = [ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in retry_urls]
+            for _ in as_completed(futs):
+                pass
+
+    # Rebuild the package after retry (exclude result.zip to avoid nesting)
+    (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
+
+    # Return updated status
+    with lock:
+        return jsonify(json.loads(status_file.read_text()))
+
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+# -----------------------------
+# ZIP helpers
+# -----------------------------
+
+def zip_directory_to_bytes(base_dir: Path, exclude: set[str] | None = None) -> bytes:
+    exclude = exclude or set()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _, files in os.walk(base_dir):
+            for f in files:
+                if f in exclude:
+                    continue
+                full = Path(root) / f
+                arc = full.relative_to(base_dir)
+                zf.write(full, arcname=str(arc))
+    buf.seek(0)
+    return buf.getvalue()
+
+def zip_selected_paths(base_dir: Path, folders: List[Path], exclude: set[str] | None = None) -> io.BytesIO:
+    exclude = exclude or set()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for folder in folders:
+            for root, _, files in os.walk(folder):
+                for f in files:
+                    if f in exclude:
+                        continue
+                    full = Path(root) / f
+                    arc = full.relative_to(base_dir)
+                    zf.write(full, arcname=str(arc))
+    buf.seek(0)
+    return buf
+
+# -----------------------------
+# Entrypoint
+# -----------------------------
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = ScreenTranslatorApp(root)
-    root.mainloop()
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Screen Translator</title>
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+  <div class="max-w-4xl mx-auto p-6 space-y-6">
+    <header class="flex items-center justify-between">
+      <h1 class="text-3xl font-bold">📖 Screen Translator</h1>
+      <div id="toast" class="hidden px-3 py-1 rounded bg-emerald-600 text-sm"></div>
+    </header>
+
+    <section class="bg-gray-800 rounded-2xl p-4 shadow">
+      <label for="urls" class="block text-sm mb-2 opacity-80">One URL per line</label>
+      <textarea id="urls" class="w-full h-36 p-3 text-black rounded" placeholder="https://example.com/chapter/1
+https://example.com/chapter/2"></textarea>
+      <div class="flex items-center gap-3 mt-3 flex-wrap">
+        <button id="startBtn" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded disabled:opacity-60 disabled:cursor-not-allowed">Start Translation</button>
+        <button id="retryAllBtn" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded hidden">Retry Failed</button>
+        <button id="downloadFinishedBtn" class="px-4 py-2 bg-amber-600 hover:bg-amber-700 rounded hidden">Download Finished So Far</button>
+        <span id="jobIdBadge" class="text-xs opacity-70"></span>
+      </div>
+    </section>
+
+    <section id="progressSection" class="bg-gray-800 rounded-2xl p-4 shadow hidden">
+      <div id="overallBlock" class="mb-4">
+        <div class="flex items-center justify-between mb-1">
+          <p class="font-semibold">Overall Progress</p>
+          <p id="overallCounts" class="text-sm opacity-80"></p>
+        </div>
+        <div class="w-full bg-gray-700 rounded h-4">
+          <div id="overallBar" class="bg-green-500 h-4 rounded" style="width:0%"></div>
+        </div>
+      </div>
+
+      <div id="jobsList" class="space-y-3"></div>
+
+      <div id="downloadBlock" class="mt-4 hidden">
+        <a id="downloadLink" href="#" class="inline-block bg-yellow-500 hover:bg-yellow-600 text-black font-medium px-4 py-2 rounded">Download Final Package</a>
+      </div>
+    </section>
+  </div>
+
+<script>
+const API_BASE = window.location.origin;
+let jobId = null;
+let pollTimer = null;
+
+const $ = (sel) => document.querySelector(sel);
+const show = (el) => el.classList.remove('hidden');
+const hide = (el) => el.classList.add('hidden');
+
+function toast(msg, ok=true) {
+  const t = $('#toast');
+  t.textContent = msg;
+  t.className = ok
+    ? "px-3 py-1 rounded bg-emerald-600 text-sm"
+    : "px-3 py-1 rounded bg-rose-600 text-sm";
+  show(t);
+  setTimeout(() => hide(t), 1800);
+}
+
+function parseUrls() {
+  return $('#urls').value
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
+function setStartLoading(isLoading) {
+  const btn = $('#startBtn');
+  btn.disabled = isLoading;
+  btn.textContent = isLoading ? "Starting..." : "Start Translation";
+}
+
+async function startJob() {
+  const urls = parseUrls();
+  if (urls.length === 0) {
+    toast("Add at least one URL.", false);
+    return;
+  }
+  setStartLoading(true);
+  try {
+    const res = await fetch(`${API_BASE}/api/start-translation`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ urls })
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to start job");
+    jobId = data.job_id;
+    $('#jobIdBadge').textContent = `Job: ${jobId}`;
+    show($('#progressSection'));
+    renderInitial(urls);
+    pollStatus(true);
+  } catch (e) {
+    toast(e.message || "Error starting job", false);
+    setStartLoading(false);
+  }
+}
+
+function renderInitial(urls) {
+  $('#overallBar').style.width = '0%';
+  $('#overallCounts').textContent = `0 / ${urls.length} URLs`;
+  $('#jobsList').innerHTML = urls.map(u => jobRow(u, {progress:0, total:0, status:'queued'})).join('');
+  hide($('#downloadBlock'));
+  hide($('#retryAllBtn'));
+  hide($('#downloadFinishedBtn'));
+}
+
+function jobRow(url, job) {
+  const status = job?.status || 'queued';
+  const total = Number.isFinite(job?.total) ? job.total : 0;
+  const progress = Number.isFinite(job?.progress) ? job.progress : 0;
+  const percent = total > 0 ? Math.round((progress / total) * 100) : (status === 'finished' ? 100 : 0);
+  const badge = renderBadge(status);
+  const folder = job?.folder || ""; // <-- grab folder
+
+  const retryBtn = status === 'failed'
+    ? `<button data-url="${escapeHtml(url)}" class="retryOne px-2 py-1 text-xs bg-red-600 hover:bg-red-700 rounded">Retry</button>`
+    : '';
+
+  // 👇 Use folder param instead of ?u=
+  const downloadOneBtn = (status === 'finished' && folder)
+    ? `<a href="${API_BASE}/api/download-one/${jobId}?folder=${encodeURIComponent(folder)}" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 rounded">Download</a>`
+    : '';
+
+  return `
+    <div class="p-3 rounded bg-gray-900">
+      <div class="flex items-center justify-between mb-1 gap-3">
+        <p class="text-sm truncate">${escapeHtml(url)}</p>
+        <div class="flex items-center gap-2">
+          <span>${badge}</span>
+          ${retryBtn}
+          ${downloadOneBtn}
+          <span class="text-xs opacity-80">${progress}/${total}</span>
+        </div>
+      </div>
+      <div class="w-full bg-gray-700 rounded h-2">
+        <div class="bg-blue-500 h-2 rounded" style="width:${percent}%"></div>
+      </div>
+    </div>
+  `;
+}
+
+function renderBadge(status) {
+  const map = {
+    queued:  "bg-slate-600",
+    running: "bg-amber-600",
+    finished:"bg-emerald-600",
+    failed:  "bg-rose-600",
+    skipped: "bg-zinc-600",
+  };
+  const cls = map[status] || "bg-slate-600";
+  const label = status.charAt(0).toUpperCase() + status.slice(1);
+  return `<span class="px-2 py-0.5 rounded text-xs ${cls}">${label}</span>`;
+}
+
+function escapeHtml(s) {
+  return s.replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])
+  );
+}
+
+async function pollStatus(first=false) {
+  if (!jobId) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/job-status/${jobId}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Status error");
+
+    // Overall = URLs-based progress
+    const overallTotal = data.overall?.total ?? 0;
+    const overallProgress = data.overall?.progress ?? 0;
+    const overallPercent = overallTotal > 0 ? (overallProgress / overallTotal) * 100 : 0;
+    $('#overallBar').style.width = `${overallPercent}%`;
+    $('#overallCounts').textContent = `${overallProgress} / ${overallTotal} URLs`;
+
+    // Per-URL rows
+    const jobs = data.jobs || {};
+    const html = Object.entries(jobs)
+      .map(([url, job]) => jobRow(url, job))
+      .join('');
+    $('#jobsList').innerHTML = html;
+
+    // Show Retry Failed if anything failed
+    const hasFailed = Object.values(jobs).some(j => j?.status === 'failed');
+    if (hasFailed) show($('#retryAllBtn')); else hide($('#retryAllBtn'));
+
+    // Show "Download finished so far" if any finished
+    const finishedCount = Object.values(jobs).filter(j => j?.status === 'finished').length;
+    if (finishedCount > 0) show($('#downloadFinishedBtn')); else hide($('#downloadFinishedBtn'));
+
+    // Final package when fully finished
+    if (data.status === 'finished') {
+      $('#downloadLink').href = `${API_BASE}/api/download/${jobId}`;
+      show($('#downloadBlock'));
+      setStartLoading(false);
+      // keep polling in case user retries later
+    } else {
+      clearTimeout(pollTimer);
+      pollTimer = setTimeout(pollStatus, first ? 1200 : 2000);
+    }
+
+    // Hook up per-URL retry
+    document.querySelectorAll('.retryOne').forEach(btn => {
+      btn.onclick = async (e) => {
+        const url = e.target.getAttribute('data-url');
+        await retryUrls([url]);
+      };
+    });
+
+  } catch (e) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(pollStatus, 2500);
+  }
+}
+
+async function retryUrls(urls) {
+  if (!jobId) return;
+  try {
+    const res = await fetch(`${API_BASE}/api/retry-url/${jobId}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(urls && urls.length ? { urls } : {})
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Retry failed");
+    toast(urls && urls.length ? "Retry queued" : "Retrying failed URLs");
+    clearTimeout(pollTimer);
+    pollStatus(true);
+  } catch (e) {
+    toast(e.message || "Retry error", false);
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  $('#startBtn').onclick = startJob;
+  $('#retryAllBtn').onclick = async () => retryUrls([]); // retry all failed
+  $('#downloadFinishedBtn').onclick = () => {
+    if (!jobId) return;
+    window.location.href = `${API_BASE}/api/download-finished/${jobId}`;
+  };
+});
+</script>
+</body>
+</html>
