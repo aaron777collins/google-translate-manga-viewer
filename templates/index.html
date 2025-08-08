@@ -5,6 +5,10 @@
 <title>Screen Translator</title>
 <meta name="viewport" content="width=device-width,initial-scale=1" />
 <script src="https://cdn.tailwindcss.com"></script>
+<style>
+  /* Modal scroll-friendly preview */
+  #previewModal.open { display: flex; }
+</style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
   <div class="max-w-4xl mx-auto p-6 space-y-6">
@@ -42,6 +46,22 @@ https://example.com/chapter/2"></textarea>
         <a id="downloadLink" href="#" class="inline-block bg-yellow-500 hover:bg-yellow-600 text-black font-medium px-4 py-2 rounded">Download Final Package</a>
       </div>
     </section>
+  </div>
+
+  <!-- Preview Modal -->
+  <div id="previewModal" class="hidden fixed inset-0 z-50 bg-black/80 items-center justify-center p-4">
+    <div class="relative w-full max-w-4xl bg-gray-900 rounded-2xl shadow-lg overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+        <h2 id="previewTitle" class="text-lg font-semibold">Preview</h2>
+        <div class="flex items-center gap-2">
+          <a id="openInNewTab" target="_blank" rel="noopener" class="text-sm px-3 py-1 rounded bg-gray-700 hover:bg-gray-600">Open in new tab</a>
+          <button id="closePreview" class="px-3 py-1 rounded bg-rose-600 hover:bg-rose-700">Close</button>
+        </div>
+      </div>
+      <div class="max-h-[80vh] overflow-auto p-4">
+        <img id="previewImg" src="" alt="Translated preview" class="w-full h-auto block">
+      </div>
+    </div>
   </div>
 
 <script>
@@ -134,13 +154,18 @@ function jobRow(url, job) {
     ? `<a href="${API_BASE}/api/download-one/${jobId}?folder=${encodeURIComponent(folder)}" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 rounded">Download</a>`
     : '';
 
+  const previewBtn = (status === 'finished' && folder)
+    ? `<button data-folder="${encodeURIComponent(folder)}" data-url="${escapeHtml(url)}" class="previewOne px-2 py-1 text-xs bg-teal-600 hover:bg-teal-700 rounded">Preview</button>`
+    : '';
+
   return `
     <div class="p-3 rounded bg-gray-900">
       <div class="flex items-center justify-between mb-1 gap-3">
-        <p class="text-sm truncate">${escapeHtml(url)}</p>
+        <p class="text-sm truncate" title="${escapeHtml(url)}">${escapeHtml(url)}</p>
         <div class="flex items-center gap-2">
           <span>${badge}</span>
           ${retryBtn}
+          ${previewBtn}
           ${downloadOneBtn}
           <span class="text-xs opacity-80">${progress}/${total}</span>
         </div>
@@ -205,10 +230,18 @@ async function pollStatus(first=false) {
       pollTimer = setTimeout(pollStatus, first ? 1200 : 2000);
     }
 
+    // wire actions after render
     document.querySelectorAll('.retryOne').forEach(btn => {
       btn.onclick = async (e) => {
         const url = e.target.getAttribute('data-url');
         await retryUrls([url]);
+      };
+    });
+    document.querySelectorAll('.previewOne').forEach(btn => {
+      btn.onclick = (e) => {
+        const folder = e.currentTarget.getAttribute('data-folder');
+        const url = decodeURIComponent(folder); // not shown, but we set title below separately
+        openPreview(folder, e.currentTarget.getAttribute('data-url') || '');
       };
     });
 
@@ -236,6 +269,22 @@ async function retryUrls(urls) {
   }
 }
 
+/* ---------- Preview modal helpers ---------- */
+function openPreview(encodedFolder, urlLabel) {
+  if (!jobId) return;
+  const src = `${API_BASE}/api/preview/${jobId}?folder=${encodedFolder}`;
+  $('#previewImg').src = src;
+  $('#openInNewTab').href = src;
+  $('#previewTitle').textContent = `Preview — ${urlLabel || decodeURIComponent(encodedFolder)}`;
+  $('#previewModal').classList.add('open');
+  show($('#previewModal'));
+}
+function closePreview() {
+  $('#previewImg').src = "";
+  hide($('#previewModal'));
+  $('#previewModal').classList.remove('open');
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const params = new URLSearchParams(window.location.search);
   const savedJob = params.get('job');
@@ -252,6 +301,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!jobId) return;
     window.location.href = `${API_BASE}/api/download-finished/${jobId}`;
   };
+
+  // modal events
+  $('#closePreview').onclick = closePreview;
+  $('#previewModal').addEventListener('click', (e) => {
+    if (e.target === $('#previewModal')) closePreview();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closePreview();
+  });
 });
 </script>
 </body>
