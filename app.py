@@ -547,6 +547,25 @@ def retry_failed_urls(job_id):
     # Return updated status
     with lock:
         return jsonify(json.loads(status_file.read_text()))
+    
+@app.route("/api/preview/<job_id>")
+def preview_image(job_id):
+    """Serve the stitched PNG for a single URL folder."""
+    job_root = JOBS_DIR / job_id
+    status_file = job_root / "status.json"
+    if not status_file.exists():
+        return jsonify({"error": "Job not found"}), 404
+
+    folder = (request.args.get("folder") or "").strip()
+    if not folder:
+        return jsonify({"error": "Missing folder"}), 400
+
+    target = (job_root / folder / "translated_final.png")
+    if not target.exists():
+        return jsonify({"error": "Preview not available"}), 404
+
+    # Stream the PNG so the browser can display it
+    return send_file(target, mimetype="image/png")
 
 @app.route("/")
 def index():
