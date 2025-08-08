@@ -4,4 +4,7 @@ requests
 beautifulsoup4
 pillow
 gunicorn
-google
+google-cloud-vision>=3.9.0
+google-cloud-translate>=3.12.4
+dotenv
+scikit-learn
