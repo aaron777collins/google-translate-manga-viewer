@@ -91,7 +91,14 @@ async function startJob() {
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Failed to start job");
+
     jobId = data.job_id;
+
+    // store in URL for bookmarking/resume
+    const params = new URLSearchParams(window.location.search);
+    params.set('job', jobId);
+    history.replaceState({}, '', `${location.pathname}?${params}`);
+
     $('#jobIdBadge').textContent = `Job: ${jobId}`;
     show($('#progressSection'));
     renderInitial(urls);
@@ -117,13 +124,12 @@ function jobRow(url, job) {
   const progress = Number.isFinite(job?.progress) ? job.progress : 0;
   const percent = total > 0 ? Math.round((progress / total) * 100) : (status === 'finished' ? 100 : 0);
   const badge = renderBadge(status);
-  const folder = job?.folder || ""; // <-- grab folder
+  const folder = job?.folder || "";
 
   const retryBtn = status === 'failed'
     ? `<button data-url="${escapeHtml(url)}" class="retryOne px-2 py-1 text-xs bg-red-600 hover:bg-red-700 rounded">Retry</button>`
     : '';
 
-  // 👇 Use folder param instead of ?u=
   const downloadOneBtn = (status === 'finished' && folder)
     ? `<a href="${API_BASE}/api/download-one/${jobId}?folder=${encodeURIComponent(folder)}" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 rounded">Download</a>`
     : '';
@@ -172,40 +178,33 @@ async function pollStatus(first=false) {
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || "Status error");
 
-    // Overall = URLs-based progress
     const overallTotal = data.overall?.total ?? 0;
     const overallProgress = data.overall?.progress ?? 0;
     const overallPercent = overallTotal > 0 ? (overallProgress / overallTotal) * 100 : 0;
     $('#overallBar').style.width = `${overallPercent}%`;
     $('#overallCounts').textContent = `${overallProgress} / ${overallTotal} URLs`;
 
-    // Per-URL rows
     const jobs = data.jobs || {};
     const html = Object.entries(jobs)
       .map(([url, job]) => jobRow(url, job))
       .join('');
     $('#jobsList').innerHTML = html;
 
-    // Show Retry Failed if anything failed
     const hasFailed = Object.values(jobs).some(j => j?.status === 'failed');
     if (hasFailed) show($('#retryAllBtn')); else hide($('#retryAllBtn'));
 
-    // Show "Download finished so far" if any finished
     const finishedCount = Object.values(jobs).filter(j => j?.status === 'finished').length;
     if (finishedCount > 0) show($('#downloadFinishedBtn')); else hide($('#downloadFinishedBtn'));
 
-    // Final package when fully finished
     if (data.status === 'finished') {
       $('#downloadLink').href = `${API_BASE}/api/download/${jobId}`;
       show($('#downloadBlock'));
       setStartLoading(false);
-      // keep polling in case user retries later
     } else {
       clearTimeout(pollTimer);
       pollTimer = setTimeout(pollStatus, first ? 1200 : 2000);
     }
 
-    // Hook up per-URL retry
     document.querySelectorAll('.retryOne').forEach(btn => {
       btn.onclick = async (e) => {
         const url = e.target.getAttribute('data-url');
@@ -238,8 +237,17 @@ async function retryUrls(urls) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
+  const params = new URLSearchParams(window.location.search);
+  const savedJob = params.get('job');
+  if (savedJob) {
+    jobId = savedJob;
+    $('#jobIdBadge').textContent = `Job: ${jobId}`;
+    show($('#progressSection'));
+    pollStatus(true);
+  }
+
   $('#startBtn').onclick = startJob;
-  $('#retryAllBtn').onclick = async () => retryUrls([]); // retry all failed
+  $('#retryAllBtn').onclick = async () => retryUrls([]);
   $('#downloadFinishedBtn').onclick = () => {
     if (!jobId) return;
     window.location.href = `${API_BASE}/api/download-finished/${jobId}`;
