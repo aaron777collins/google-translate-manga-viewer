@@ -11,14 +11,16 @@ import zipfile
 import uuid
 import json
 import threading
+import traceback
+from datetime import datetime, timezone
 from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, Protocol, Sequence
+from typing import List, Tuple, Optional, Protocol, Sequence, Callable, Dict, Any
 from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, send_file, render_template, g
 from dotenv import load_dotenv
 import requests
 from bs4 import BeautifulSoup
@@ -54,6 +56,9 @@ def _get_lock(job_id: str) -> Lock:
 # -----------------------------
 # Utilities
 # -----------------------------
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -109,12 +114,97 @@ def stitch_vertically(pil_images: List[Image.Image]) -> Image.Image:
     return canvas
 
 # -----------------------------
+# Status & Error Recording
+# -----------------------------
+
+def _safe_json_read(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        # Corrupted status file: keep a backup and start fresh
+        backup = path.with_suffix(".corrupt.json")
+        try:
+            backup.write_text(path.read_text())
+        except Exception:
+            pass
+        return {}
+
+def update_status(job_id, **kwargs):
+    status_file = JOBS_DIR / job_id / "status.json"
+    lock = _get_lock(job_id)
+    with lock:
+        status = _safe_json_read(status_file)
+
+        for key, value in kwargs.items():
+            if key == "jobs" and isinstance(value, dict):
+                status.setdefault("jobs", {})
+                # deep-merge per-URL dicts
+                for u, meta in value.items():
+                    if isinstance(meta, dict) and isinstance(status["jobs"].get(u), dict):
+                        status["jobs"][u].update(meta)
+                    else:
+                        status["jobs"][u] = meta
+            elif key == "errors" and isinstance(value, list):
+                # append error records
+                status.setdefault("errors", [])
+                status["errors"].extend(value)
+            elif isinstance(value, dict) and isinstance(status.get(key), dict):
+                status[key].update(value)
+            else:
+                status[key] = value
+
+        status_file.write_text(json.dumps(status, indent=2))
+
+def record_error(
+    job_id: Optional[str],
+    *,
+    scope: str,           # e.g. "api", URL string, "worker:<url>", "zip", etc.
+    code: str,            # machine-readable code
+    message: str,         # human message
+    where: Optional[str] = None,   # function or component
+    request_id: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+    exc: Optional[BaseException] = None
+) -> None:
+    err: Dict[str, Any] = {
+        "ts": now_iso(),
+        "scope": scope,
+        "code": code,
+        "message": message,
+    }
+    if where:
+        err["where"] = where
+    if request_id:
+        err["request_id"] = request_id
+    if extra:
+        err["extra"] = extra
+    if exc:
+        err["exception_type"] = exc.__class__.__name__
+        err["traceback"] = "".join(traceback.format_exception(exc)).strip()
+
+    if job_id:
+        update_status(job_id, errors=[err])
+    else:
+        # no job id: write to a global file
+        global_err = JOBS_DIR / "global_errors.jsonl"
+        with open(global_err, "a", encoding="utf-8") as f:
+            f.write(json.dumps(err) + "\n")
+
+# -----------------------------
 # Strategy interfaces (protocol)
 # -----------------------------
 
 class ScraperStrategy(Protocol):
     def supports(self, url: str) -> bool: ...
-    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]: ...
+    def download_pages(
+        self,
+        url: str,
+        out_dir: Path,
+        session: requests.Session,
+        on_error: Optional[Callable[[str, Exception], None]] = None
+    ) -> List[Path]: ...
 
 # -----------------------------
 # Generic scraper framework
@@ -148,7 +238,13 @@ class GenericScraper(ScraperStrategy):
         """Filename prefix (default: self.name). Override to include IDs (e.g. chapter id)."""
         return self.name
 
-    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+    def download_pages(
+        self,
+        url: str,
+        out_dir: Path,
+        session: requests.Session,
+        on_error: Optional[Callable[[str, Exception], None]] = None
+    ) -> List[Path]:
         pages = list(self.get_pages(url, session))
         prefix = self.file_prefix(url)
         paths: List[Path] = []
@@ -161,6 +257,11 @@ class GenericScraper(ScraperStrategy):
                 out_path.write_bytes(r.content)
                 paths.append(out_path)
             except Exception as e:
+                if on_error:
+                    try:
+                        on_error(item.url, e)
+                    except Exception:
+                        pass
                 log(f"[{self.__class__.__name__}] ERROR downloading {item.url}: {e}")
         return paths
 
@@ -321,11 +422,17 @@ class UsagiOneScraper(GenericScraper):
         return items
 
     # Add Referer during file GETs (common requirement for readers)
-    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+    def download_pages(
+        self,
+        url: str,
+        out_dir: Path,
+        session: requests.Session,
+        on_error: Optional[Callable[[str, Exception], None]] = None
+    ) -> List[Path]:
         old_ref = session.headers.get("Referer")
         session.headers["Referer"] = url
         try:
-            return super().download_pages(url, out_dir, session)
+            return super().download_pages(url, out_dir, session, on_error=on_error)
         finally:
             if old_ref is None:
                 session.headers.pop("Referer", None)
@@ -345,7 +452,11 @@ class TranslatorAPI:
     max_retries: int = 3
     backoff_base: float = 1.5
 
-    def translate_image(self, image_bytes: bytes) -> Optional[bytes]:
+    def translate_image(self, image_bytes: bytes) -> Tuple[Optional[bytes], Optional[str]]:
+        """
+        Returns (translated_png_bytes, error_message). On success, error_message is None.
+        """
+        last_err: Optional[str] = None
         for attempt in range(self.max_retries):
             try:
                 files = {"file": ("page.png", image_bytes, "image/png")}
@@ -353,11 +464,23 @@ class TranslatorAPI:
                 headers = {"X-API-KEY": self.api_key}
                 resp = requests.post(self.api_url, headers=headers, files=files, data=data, timeout=self.timeout)
                 resp.raise_for_status()
-                b64_png = resp.json()["translated_image"].split(",", 1)[1]
-                return base64.b64decode(b64_png)
-            except Exception:
+                body = resp.json()
+                b64_png = body.get("translated_image", "")
+                if "," in b64_png:
+                    b64_png = b64_png.split(",", 1)[1]
+                if not b64_png:
+                    last_err = "empty_translated_image"
+                    time.sleep(self.backoff_base ** attempt)
+                    continue
+                return base64.b64decode(b64_png), None
+            except Exception as e:
+                # capture HTTP details if available
+                status = getattr(e, "response", None).status_code if hasattr(e, "response") and e.response else None
+                last_err = f"{e.__class__.__name__}: {str(e)}"
+                if status:
+                    last_err += f" (status={status})"
                 time.sleep(self.backoff_base ** attempt)
-        return None
+        return None, last_err
 
 # -----------------------------
 # Job Runner with Status Tracking
@@ -372,34 +495,10 @@ class JobConfig:
     timeout: int = 60
     retries: int = 3
 
-def update_status(job_id, **kwargs):
-    status_file = JOBS_DIR / job_id / "status.json"
-    lock = _get_lock(job_id)
-    with lock:
-        status = {}
-        if status_file.exists():
-            status = json.loads(status_file.read_text())
-
-        for key, value in kwargs.items():
-            if key == "jobs" and isinstance(value, dict):
-                status.setdefault("jobs", {})
-                # deep-merge per-URL dicts
-                for u, meta in value.items():
-                    if isinstance(meta, dict) and isinstance(status["jobs"].get(u), dict):
-                        status["jobs"][u].update(meta)
-                    else:
-                        status["jobs"][u] = meta
-            elif isinstance(value, dict) and isinstance(status.get(key), dict):
-                status[key].update(value)
-            else:
-                status[key] = value
-
-        status_file.write_text(json.dumps(status, indent=2))
-
 def process_url(
     url,
     scrapers,
-    translator,
+    translator: TranslatorAPI,
     cfg,
     session,
     job_id=None
@@ -413,17 +512,25 @@ def process_url(
     strategy = next((s for s in scrapers if s.supports(url)), None)
     if not strategy:
         if job_id:
+            record_error(job_id, scope=url, code="unsupported_host", message="No scraper supports this URL", where="process_url")
             update_status(job_id, jobs={url: {"status": "failed", "error": "unsupported_host"}})
         return
 
     try:
-        # Download pages
-        originals = strategy.download_pages(url, out_dir, session)
+        # Download pages (with per-image error callback)
+        def dl_err(img_url: str, exc: Exception):
+            record_error(job_id, scope=url, code="download_failed",
+                         message=f"Failed to download page image",
+                         where="GenericScraper.download_pages",
+                         extra={"img_url": img_url},
+                         exc=exc)
+
+        originals = strategy.download_pages(url, out_dir, session, on_error=dl_err)
         total_pages = len(originals)
 
         # Initialize per-URL tracking
         if job_id:
-            update_status(job_id, jobs={url: {"progress": 0, "total": total_pages, "status": "running", "folder": folder_rel}})
+            update_status(job_id, jobs={url: {"progress": 0, "total": total_pages, "status": "running"}})
 
         # No pages -> treat as failed (retryable)
         if total_pages == 0:
@@ -431,49 +538,95 @@ def process_url(
                 status_file = JOBS_DIR / job_id / "status.json"
                 lock = _get_lock(job_id)
                 with lock:
-                    status = json.loads(status_file.read_text())
-                    status["jobs"].setdefault(url, {})
+                    status = _safe_json_read(status_file)
+                    status.setdefault("jobs", {}).setdefault(url, {})
                     status["jobs"][url].update({"status": "failed", "error": "no_pages"})
                     status_file.write_text(json.dumps(status, indent=2))
+                record_error(job_id, scope=url, code="no_pages", message="Scraper returned 0 pages", where="process_url")
             return
 
-        def work(page_path):
-            index = extract_index_from_name(page_path.name)
-            img_bytes = page_path.read_bytes()
-            translated_bytes = translator.translate_image(img_bytes)
-            im = Image.open(BytesIO(translated_bytes or img_bytes)).copy()
-            if cfg.rotate_90:
-                im = im.transpose(Image.ROTATE_90)
-            im.convert("RGB").save(out_dir / f"translated_{index:03d}.png", "PNG")
-            return index, im
+        def work(page_path: Path):
+            try:
+                index = extract_index_from_name(page_path.name)
+                img_bytes = page_path.read_bytes()
+                translated_bytes, xerr = translator.translate_image(img_bytes)
+
+                # If translation failed, fall back to original but record error
+                used_bytes = translated_bytes or img_bytes
+                if xerr:
+                    record_error(job_id, scope=f"worker:{url}", code="translate_failed",
+                                 message=xerr, where="TranslatorAPI.translate_image",
+                                 extra={"page_index": index, "file": page_path.name})
+
+                # Load and post-process
+                im = Image.open(BytesIO(used_bytes))
+                im.load()  # ensure the image is fully loaded before closing BytesIO
+                if cfg.rotate_90:
+                    im = im.transpose(Image.ROTATE_90)
+                # Save translated (or original) page
+                im.convert("RGB").save(out_dir / f"translated_{index:03d}.png", "PNG")
+                return index, im
+            except Exception as e:
+                record_error(job_id, scope=f"worker:{url}", code="page_processing_error",
+                             message="Failed to process page image", where="work",
+                             extra={"file": page_path.name}, exc=e)
+                raise
 
         completed_pages = 0
-        images_indexed = []
+        images_indexed: List[Tuple[int, Image.Image]] = []
+        errors_during_pages = False
+
         with ThreadPoolExecutor(max_workers=cfg.pages_workers) as ex:
-            for fut in as_completed([ex.submit(work, p) for p in originals]):
-                idx, im = fut.result()
-                images_indexed.append((idx, im))
-                completed_pages += 1
-                if job_id:
-                    status_file = JOBS_DIR / job_id / "status.json"
-                    lock = _get_lock(job_id)
-                    with lock:
-                        status = json.loads(status_file.read_text())
-                        status["jobs"][url]["progress"] = completed_pages
-                        status_file.write_text(json.dumps(status, indent=2))
+            futures = [ex.submit(work, p) for p in originals]
+            for fut in as_completed(futures):
+                try:
+                    idx, im = fut.result()
+                    images_indexed.append((idx, im))
+                    completed_pages += 1
+                    if job_id:
+                        status_file = JOBS_DIR / job_id / "status.json"
+                        lock = _get_lock(job_id)
+                        with lock:
+                            status = _safe_json_read(status_file)
+                            status.setdefault("jobs", {}).setdefault(url, {})
+                            status["jobs"][url]["progress"] = completed_pages
+                            status_file.write_text(json.dumps(status, indent=2))
+                except Exception:
+                    errors_during_pages = True
+                    # progress already updated for other futures; continue
+
+        if not images_indexed:
+            # If every page failed, mark failed
+            if job_id:
+                status_file = JOBS_DIR / job_id / "status.json"
+                lock = _get_lock(job_id)
+                with lock:
+                    status = _safe_json_read(status_file)
+                    status.setdefault("jobs", {}).setdefault(url, {})
+                    status["jobs"][url].update({"status": "failed", "error": "all_pages_failed"})
+                    status_file.write_text(json.dumps(status, indent=2))
+            record_error(job_id, scope=url, code="all_pages_failed",
+                         message="All page workers failed", where="process_url")
+            return
 
         # Save stitched image
-        images_indexed.sort(key=lambda t: t[0])
-        stitched = stitch_vertically([im for _, im in images_indexed])
-        stitched.save(out_dir / f"translated_final.png", "PNG")
+        try:
+            images_indexed.sort(key=lambda t: t[0])
+            stitched = stitch_vertically([im for _, im in images_indexed])
+            stitched.save(out_dir / f"translated_final.png", "PNG")
+        except Exception as e:
+            record_error(job_id, scope=url, code="stitch_failed",
+                         message="Failed to stitch final image", where="stitch_vertically", exc=e)
+            # Even if stitching fails, continue to mark finished if at least one page saved
 
         # Mark URL job finished (SUCCESS) and increment overall URL count
         if job_id:
             status_file = JOBS_DIR / job_id / "status.json"
             lock = _get_lock(job_id)
             with lock:
-                status = json.loads(status_file.read_text())
-                status["jobs"][url]["status"] = "finished"
+                status = _safe_json_read(status_file)
+                status.setdefault("jobs", {}).setdefault(url, {})
+                status["jobs"][url]["status"] = "finished" if not errors_during_pages else "finished_with_warnings"
                 if "overall" in status and "progress" in status["overall"]:
                     status["overall"]["progress"] += 1
                 status_file.write_text(json.dumps(status, indent=2))
@@ -484,10 +637,12 @@ def process_url(
             status_file = JOBS_DIR / job_id / "status.json"
             lock = _get_lock(job_id)
             with lock:
-                status = json.loads(status_file.read_text())
+                status = _safe_json_read(status_file)
                 status.setdefault("jobs", {}).setdefault(url, {"progress": 0, "total": 0})
                 status["jobs"][url].update({"status": "failed", "error": str(e)})
                 status_file.write_text(json.dumps(status, indent=2))
+        record_error(job_id, scope=url, code="unhandled_exception",
+                     message="Unhandled exception while processing URL", where="process_url", exc=e)
         return
 
 def run_translation_job(job_id, urls, batch_workers, page_workers, target_lang, rotate_90, timeout, retries):
@@ -500,15 +655,51 @@ def run_translation_job(job_id, urls, batch_workers, page_workers, target_lang, 
     strategies: List[ScraperStrategy] = list(_SCRAPER_REGISTRY)
     cfg = JobConfig(out_base=job_root, pages_workers=page_workers, rotate_90=rotate_90, target_lang=target_lang, timeout=timeout, retries=retries)
 
-    with requests.Session() as session:
-        session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
-        with ThreadPoolExecutor(max_workers=batch_workers) as ex:
-            for _ in as_completed([ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in urls]):
-                pass
+    try:
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
+            with ThreadPoolExecutor(max_workers=batch_workers) as ex:
+                for _ in as_completed([ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in urls]):
+                    pass
 
-    # Build final zip when everything is finished
-    (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
-    update_status(job_id, status="finished")
+        # Build final zip when everything is finished
+        try:
+            (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
+        except Exception as e:
+            record_error(job_id, scope="zip", code="zip_build_failed",
+                         message="Failed to build final result.zip", where="run_translation_job", exc=e)
+        update_status(job_id, status="finished")
+    except Exception as e:
+        record_error(job_id, scope="job", code="run_failed",
+                     message="Unhandled exception in run_translation_job", where="run_translation_job", exc=e)
+        update_status(job_id, status="failed")
+
+# -----------------------------
+# Flask request context helpers
+# -----------------------------
+
+@app.before_request
+def assign_request_id():
+    g.request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+
+@app.after_request
+def attach_request_id(resp):
+    # Always echo a request id for correlation
+    resp.headers["X-Request-ID"] = getattr(g, "request_id", "")
+    return resp
+
+def _json_error(code: int, message: str, *, job_id: Optional[str] = None, err_code: Optional[str] = None, extra: Optional[Dict[str, Any]] = None):
+    payload = {
+        "error": message,
+        "code": err_code or "error",
+        "request_id": getattr(g, "request_id", None),
+        "ts": now_iso(),
+    }
+    if extra:
+        payload["extra"] = extra
+    if job_id:
+        record_error(job_id, scope="api", code=payload["code"], message=message, where=request.endpoint or "api", request_id=payload["request_id"], extra=extra)
+    return jsonify(payload), code
 
 # -----------------------------
 # API Endpoints
@@ -516,10 +707,11 @@ def run_translation_job(job_id, urls, batch_workers, page_workers, target_lang, 
 
 @app.route("/api/start-translation", methods=["POST"])
 def start_translation():
-    data = request.get_json(force=True)
+    data = request.get_json(force=True, silent=True) or {}
     urls = [u.strip() for u in data.get("urls", []) if isinstance(u, str) and u.strip()]
     if not urls:
-        return jsonify({"error": "No URLs provided"}), 400
+        return _json_error(400, "No URLs provided", err_code="missing_urls")
+
     job_id = str(uuid.uuid4())
     (JOBS_DIR / job_id).mkdir(parents=True, exist_ok=True)
     jobs_info = {u: {"progress": 0, "total": 0, "status": "queued"} for u in urls}
@@ -527,29 +719,35 @@ def start_translation():
     # set overall total up-front to avoid 0/0 flicker
     update_status(job_id, status="queued", overall={"progress": 0, "total": len(urls)}, jobs=jobs_info)
 
-    threading.Thread(
-        target=run_translation_job,
-        args=(job_id, urls, data.get("batch_workers", 10), data.get("page_workers", 32),
-              data.get("target_lang", "en"), data.get("rotate_90", False),
-              data.get("timeout", 60), data.get("retries", 3)),
-        daemon=True
-    ).start()
-    return jsonify({"job_id": job_id})
+    try:
+        threading.Thread(
+            target=run_translation_job,
+            args=(job_id, urls, int(data.get("batch_workers", 10)), int(data.get("page_workers", 32)),
+                  str(data.get("target_lang", "en")), bool(data.get("rotate_90", False)),
+                  int(data.get("timeout", 60)), int(data.get("retries", 3))),
+            daemon=True
+        ).start()
+    except Exception as e:
+        record_error(job_id, scope="api", code="thread_start_failed",
+                     message="Failed to start job thread", where="start_translation", exc=e)
+        return _json_error(500, "Failed to start job", job_id=job_id, err_code="start_failed")
+
+    return jsonify({"job_id": job_id, "request_id": g.request_id})
 
 @app.route("/api/job-status/<job_id>")
 def job_status(job_id):
     status_file = JOBS_DIR / job_id / "status.json"
     if not status_file.exists():
-        return jsonify({"error": "Job not found"}), 404
+        return _json_error(404, "Job not found", err_code="job_not_found")
     lock = _get_lock(job_id)
     with lock:
-        return jsonify(json.loads(status_file.read_text()))
+        return jsonify(_safe_json_read(status_file))
 
 @app.route("/api/download/<job_id>")
 def download_result(job_id):
     zip_path = JOBS_DIR / job_id / "result.zip"
     if not zip_path.exists():
-        return jsonify({"error": "Result not ready"}), 404
+        return _json_error(404, "Result not ready", job_id=job_id, err_code="result_not_ready")
     return send_file(zip_path, as_attachment=True, download_name=f"{job_id}.zip")
 
 @app.route("/api/download-finished/<job_id>")
@@ -558,26 +756,31 @@ def download_finished(job_id):
     status_file = JOBS_DIR / job_id / "status.json"
     job_root = JOBS_DIR / job_id
     if not status_file.exists():
-        return jsonify({"error": "Job not found"}), 404
+        return _json_error(404, "Job not found", err_code="job_not_found")
 
     lock = _get_lock(job_id)
     with lock:
-        status = json.loads(status_file.read_text())
+        status = _safe_json_read(status_file)
         jobs = status.get("jobs", {})
 
     folders = []
     for url, meta in jobs.items():
-        if meta.get("status") == "finished" and meta.get("folder"):
+        if meta.get("status") in ("finished", "finished_with_warnings") and meta.get("folder"):
             folder = job_root / meta["folder"]
             if folder.exists():
                 folders.append(folder)
 
     if not folders:
-        return jsonify({"error": "No finished URLs yet"}), 400
+        return _json_error(400, "No finished URLs yet", job_id=job_id, err_code="none_finished")
 
-    buf = zip_selected_paths(job_root, folders, exclude={"result.zip", "status.json"})
-    filename = f"{job_id}_finished_{int(time.time())}.zip"
-    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+    try:
+        buf = zip_selected_paths(job_root, folders, exclude={"result.zip", "status.json"})
+        filename = f"{job_id}_finished_{int(time.time())}.zip"
+        return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+    except Exception as e:
+        record_error(job_id, scope="api", code="zip_finished_failed",
+                     message="Failed to build finished-only zip", where="download_finished", exc=e)
+        return _json_error(500, "Failed to build zip", job_id=job_id, err_code="zip_failed")
 
 @app.route("/api/download-one/<job_id>")
 def download_one(job_id):
@@ -588,7 +791,7 @@ def download_one(job_id):
     job_root = JOBS_DIR / job_id
     status_file = job_root / "status.json"
     if not status_file.exists():
-        return jsonify({"error": "Job not found"}), 404
+        return _json_error(404, "Job not found", err_code="job_not_found")
 
     folder_param = request.args.get("folder", "").strip()
     url_param = request.args.get("u", "").strip()
@@ -596,17 +799,23 @@ def download_one(job_id):
     # Load status once under lock
     lock = _get_lock(job_id)
     with lock:
-        status = json.loads(status_file.read_text())
+        status = _safe_json_read(status_file)
         jobs = status.get("jobs", {})
 
     # Preferred: folder param
     if folder_param:
         target = (job_root / folder_param)
         if target.exists() and target.is_dir():
-            buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
-            filename = f"{job_id}_one_{sanitize_id(folder_param)}.zip"
-            return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
-        return jsonify({"error": "Folder not found"}), 404
+            try:
+                buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
+                filename = f"{job_id}_one_{sanitize_id(folder_param)}.zip"
+                return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+            except Exception as e:
+                record_error(job_id, scope="api", code="zip_single_failed",
+                             message="Failed to build single-folder zip", where="download_one",
+                             extra={"folder": folder_param}, exc=e)
+                return _json_error(500, "Failed to build zip", job_id=job_id, err_code="zip_failed")
+        return _json_error(404, "Folder not found", err_code="folder_not_found")
 
     # Fallback: try url param with a couple of normalizations
     if url_param:
@@ -622,12 +831,18 @@ def download_one(job_id):
         if meta and meta.get("folder"):
             target = job_root / meta["folder"]
             if target.exists():
-                buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
-                filename = f"{job_id}_one_{sanitize_id(meta['folder'])}.zip"
-                return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
-        return jsonify({"error": "URL not found in job"}), 404
+                try:
+                    buf = zip_selected_paths(job_root, [target], exclude={"result.zip", "status.json"})
+                    filename = f"{job_id}_one_{sanitize_id(meta['folder'])}.zip"
+                    return send_file(buf, mimetype="application/zip", as_attachment=True, download_name=filename)
+                except Exception as e:
+                    record_error(job_id, scope="api", code="zip_single_failed",
+                                 message="Failed to build single-folder zip", where="download_one",
+                                 extra={"url": url_param}, exc=e)
+                    return _json_error(500, "Failed to build zip", job_id=job_id, err_code="zip_failed")
+        return _json_error(404, "URL not found in job", err_code="url_not_found")
 
-    return jsonify({"error": "Missing ?folder=<id> or ?u=<url>"}), 400
+    return _json_error(400, "Missing ?folder=<id> or ?u=<url>", err_code="missing_params")
 
 @app.route("/api/retry-url/<job_id>", methods=["POST"])
 def retry_failed_urls(job_id):
@@ -635,13 +850,13 @@ def retry_failed_urls(job_id):
     status_file = JOBS_DIR / job_id / "status.json"
     job_root = JOBS_DIR / job_id
     if not status_file.exists():
-        return jsonify({"error": "Job not found"}), 404
+        return _json_error(404, "Job not found", err_code="job_not_found")
 
     # read status once
     lock = _get_lock(job_id)
     with lock:
-        status = json.loads(status_file.read_text())
-        jobs = status.get("jobs", {}).copy()  # shallow copy ok
+        status = _safe_json_read(status_file)
+        jobs = (status.get("jobs", {}) or {}).copy()  # shallow copy ok
 
     body = request.get_json(silent=True) or {}
     requested = body.get("urls")
@@ -649,7 +864,7 @@ def retry_failed_urls(job_id):
     # allow retry of specified URLs if they exist & not currently running
     def eligible(u, meta):
         st = (meta or {}).get("status")
-        return st in ("failed", "skipped")  # extend if you want
+        return st in ("failed", "skipped", "finished_with_warnings")  # extend if you want
 
     if requested:
         retry_urls = [u for u in requested if u in jobs and eligible(u, jobs[u])]
@@ -657,7 +872,7 @@ def retry_failed_urls(job_id):
         retry_urls = [u for u, meta in jobs.items() if eligible(u, meta)]
 
     if not retry_urls:
-        return jsonify({"message": "No failed URLs to retry"}), 200
+        return jsonify({"message": "No failed URLs to retry", "request_id": g.request_id}), 200
 
     # Prep runner bits
     translator = TranslatorAPI(api_url=API_URL, api_key=API_PASSWORD)
@@ -681,19 +896,28 @@ def retry_failed_urls(job_id):
         )
 
     # Run retries
-    with requests.Session() as session:
-        session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
-        with ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_WORKERS", "10"))) as ex:
-            futs = [ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in retry_urls]
-            for _ in as_completed(futs):
-                pass
+    try:
+        with requests.Session() as session:
+            session.headers.update({"User-Agent": "ScreenTranslatorAPI/1.0"})
+            with ThreadPoolExecutor(max_workers=int(os.getenv("BATCH_WORKERS", "10"))) as ex:
+                futs = [ex.submit(process_url, u, strategies, translator, cfg, session, job_id) for u in retry_urls]
+                for _ in as_completed(futs):
+                    pass
+    except Exception as e:
+        record_error(job_id, scope="api", code="retry_failed",
+                     message="Failed while retrying URLs", where="retry_failed_urls", exc=e)
+        return _json_error(500, "Retry failed", job_id=job_id, err_code="retry_failed")
 
     # Rebuild the package after retry (exclude result.zip to avoid nesting)
-    (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
+    try:
+        (job_root / "result.zip").write_bytes(zip_directory_to_bytes(job_root, exclude={"result.zip"}))
+    except Exception as e:
+        record_error(job_id, scope="zip", code="zip_build_failed",
+                     message="Failed to rebuild result.zip after retry", where="retry_failed_urls", exc=e)
 
     # Return updated status
     with lock:
-        return jsonify(json.loads(status_file.read_text()))
+        return jsonify(_safe_json_read(status_file))
 
 @app.route("/api/preview/<job_id>")
 def preview_image(job_id):
@@ -701,18 +925,56 @@ def preview_image(job_id):
     job_root = JOBS_DIR / job_id
     status_file = job_root / "status.json"
     if not status_file.exists():
-        return jsonify({"error": "Job not found"}), 404
+        return _json_error(404, "Job not found", err_code="job_not_found")
 
     folder = (request.args.get("folder") or "").strip()
     if not folder:
-        return jsonify({"error": "Missing folder"}), 400
+        return _json_error(400, "Missing folder", err_code="missing_folder")
 
     target = (job_root / folder / "translated_final.png")
     if not target.exists():
-        return jsonify({"error": "Preview not available"}), 404
+        return _json_error(404, "Preview not available", job_id=job_id, err_code="preview_missing")
 
     # Stream the PNG so the browser can display it
     return send_file(target, mimetype="image/png")
+
+@app.route("/api/errors/<job_id>")
+def job_errors(job_id):
+    """
+    Return the error log for a specific job.
+    Response Example:
+    {
+      "job_id": "...",
+      "errors": [ {ts, scope, code, message, ...}, ... ],
+      "request_id": "..."
+    }
+    """
+    status_file = JOBS_DIR / job_id / "status.json"
+    if not status_file.exists():
+        return _json_error(404, "Job not found", err_code="job_not_found")
+    lock = _get_lock(job_id)
+    with lock:
+        status = _safe_json_read(status_file)
+    return jsonify({
+        "job_id": job_id,
+        "errors": status.get("errors", []),
+        "request_id": g.request_id
+    })
+
+@app.errorhandler(404)
+def not_found(e):
+    return _json_error(404, "Not found", err_code="not_found")
+
+@app.errorhandler(405)
+def method_not_allowed(e):
+    return _json_error(405, "Method not allowed", err_code="method_not_allowed")
+
+@app.errorhandler(Exception)
+def unhandled(e):
+    # Try to attach job_id if provided as param/path in common endpoints
+    job_id = request.view_args.get("job_id") if request.view_args else None
+    record_error(job_id, scope="api", code="unhandled_exception", message=str(e), where="errorhandler", exc=e, request_id=g.request_id)
+    return _json_error(500, "Internal server error", job_id=job_id, err_code="internal_error")
 
 @app.route("/")
 def index():
@@ -732,7 +994,13 @@ def zip_directory_to_bytes(base_dir: Path, exclude: set[str] | None = None) -> b
                     continue
                 full = Path(root) / f
                 arc = full.relative_to(base_dir)
-                zf.write(full, arcname=str(arc))
+                try:
+                    zf.write(full, arcname=str(arc))
+                except Exception as e:
+                    # best-effort: log and continue
+                    record_error(None, scope="zip", code="file_zip_failed",
+                                 message=f"Failed to add file to zip: {str(arc)}",
+                                 where="zip_directory_to_bytes", exc=e)
     buf.seek(0)
     return buf.getvalue()
 
@@ -747,7 +1015,12 @@ def zip_selected_paths(base_dir: Path, folders: List[Path], exclude: set[str] | 
                         continue
                     full = Path(root) / f
                     arc = full.relative_to(base_dir)
-                    zf.write(full, arcname=str(arc))
+                    try:
+                        zf.write(full, arcname=str(arc))
+                    except Exception as e:
+                        record_error(None, scope="zip", code="file_zip_failed",
+                                     message=f"Failed to add file to zip: {str(arc)}",
+                                     where="zip_selected_paths", exc=e)
     buf.seek(0)
     return buf
 
