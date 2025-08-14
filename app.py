@@ -14,7 +14,7 @@ import threading
 from threading import Lock
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Tuple, Optional, Protocol
+from typing import List, Tuple, Optional, Protocol, Sequence
 from urllib.parse import urlparse, urljoin, unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -109,18 +109,83 @@ def stitch_vertically(pil_images: List[Image.Image]) -> Image.Image:
     return canvas
 
 # -----------------------------
-# Strategy interfaces
+# Strategy interfaces (protocol)
 # -----------------------------
 
 class ScraperStrategy(Protocol):
     def supports(self, url: str) -> bool: ...
     def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]: ...
 
-class RawKumaScraper:
+# -----------------------------
+# Generic scraper framework
+# -----------------------------
+
+@dataclass(frozen=True)
+class PageItem:
+    """
+    A single downloadable page for a chapter. `index` is 1-based and used to order pages.
+    """
+    url: str
+    index: int
+
+class GenericScraper(ScraperStrategy):
+    """
+    Base class that implements the "download pages" pipeline.
+    Subclasses implement:
+      - `supports(url) -> bool` (usually by domain match)
+      - `get_pages(url, session) -> Sequence[PageItem]`
+      - Optional: override `file_prefix(url) -> str` to control filenames.
+    """
+    name: str = "page"
+
+    def supports(self, url: str) -> bool:
+        raise NotImplementedError
+
+    def get_pages(self, url: str, session: requests.Session) -> Sequence[PageItem]:
+        raise NotImplementedError
+
+    def file_prefix(self, url: str) -> str:
+        """Filename prefix (default: self.name). Override to include IDs (e.g. chapter id)."""
+        return self.name
+
+    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+        pages = list(self.get_pages(url, session))
+        prefix = self.file_prefix(url)
+        paths: List[Path] = []
+        for item in pages:
+            fname = f"{prefix}_{int(item.index):03d}.png"
+            out_path = out_dir / fname
+            try:
+                r = session.get(item.url, timeout=60)
+                r.raise_for_status()
+                out_path.write_bytes(r.content)
+                paths.append(out_path)
+            except Exception as e:
+                log(f"[{self.__class__.__name__}] ERROR downloading {item.url}: {e}")
+        return paths
+
+# -----------------------------
+# Scraper registry (plug-and-play)
+# -----------------------------
+
+_SCRAPER_REGISTRY: List[GenericScraper] = []
+
+def register_scraper(scraper_cls: type[GenericScraper]) -> type[GenericScraper]:
+    _SCRAPER_REGISTRY.append(scraper_cls())  # instantiate once (stateless)
+    return scraper_cls
+
+# -----------------------------
+# Site scrapers (converted to GenericScraper)
+# -----------------------------
+
+@register_scraper
+class RawKumaScraper(GenericScraper):
+    name = "rawkuma"
+
     def supports(self, url: str) -> bool:
         return "rawkuma" in urlparse(url).netloc.lower()
 
-    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+    def get_pages(self, url: str, session: requests.Session) -> Sequence[PageItem]:
         log(f"[RawKuma] GET {url}")
         resp = session.get(url, timeout=30)
         resp.raise_for_status()
@@ -128,63 +193,144 @@ class RawKumaScraper:
         reader = soup.find("div", id="readerarea")
         if not reader:
             return []
-        imgs = reader.find_all("img", attrs={"data-index": True}) or [
-            img for img in reader.find_all("img")
-            if (img.get("data-src") or img.get("src")) and "placeholder" not in (img.get("src") or "")
-        ]
-        paths: List[Path] = []
+
+        # Prefer explicit data-index; fallback to visible <img> nodes
+        imgs = reader.find_all("img", attrs={"data-index": True})
+        if not imgs:
+            imgs = [
+                img for img in reader.find_all("img")
+                if (img.get("data-src") or img.get("src")) and "placeholder" not in (img.get("src") or "")
+            ]
+
+        items: List[PageItem] = []
         for idx, tag in enumerate(imgs):
             src = tag.get("data-src") or tag.get("src")
+            if not src:
+                continue
             page_num = int(tag.get("data-index") or idx) + 1
-            fname = f"rawkuma_{page_num:03d}.png"
-            out_path = out_dir / fname
             img_url = urljoin(url, src)
-            try:
-                r = session.get(img_url, timeout=45)
-                r.raise_for_status()
-                out_path.write_bytes(r.content)
-                paths.append(out_path)
-            except Exception as e:
-                log(f"[RawKuma] ERROR downloading {img_url}: {e}")
-        return paths
+            items.append(PageItem(url=img_url, index=page_num))
 
-class MangaDexScraper:
+        items.sort(key=lambda p: p.index)
+        return items
+
+@register_scraper
+class MangaDexScraper(GenericScraper):
+    name = "chapter"
+
     def supports(self, url: str) -> bool:
         return "mangadex.org" in urlparse(url).netloc.lower()
 
-    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+    def _extract_chapter_id(self, url: str) -> Optional[str]:
         parts = [p for p in url.strip().split("/") if p]
         try:
             idx = parts.index("chapter")
-            chapter_id = parts[idx + 1]
+            return parts[idx + 1]
         except Exception:
             try:
-                chapter_id = parts[4]
-            except Exception as e:
-                log(f"[MangaDex] ERROR parsing chapter id: {e}")
-                return []
+                return parts[4]
+            except Exception:
+                return None
+
+    def file_prefix(self, url: str) -> str:
+        # Include chapter id to preserve your original filename style
+        ch_id = self._extract_chapter_id(url) or "chapter"
+        return f"chapter_{ch_id}"
+
+    def get_pages(self, url: str, session: requests.Session) -> Sequence[PageItem]:
+        chapter_id = self._extract_chapter_id(url)
+        if not chapter_id:
+            log(f"[MangaDex] ERROR parsing chapter id: {url}")
+            return []
+
         api_url = f"https://api.mangadex.org/at-home/server/{chapter_id}?forcePort443=false"
         r = session.get(api_url, timeout=30)
         r.raise_for_status()
         data = r.json()
         if data.get("result") != "ok":
             return []
+
         base_url = data["baseUrl"]
         ch = data["chapter"]
         hash_val = ch["hash"]
         pages = ch["data"]
-        paths: List[Path] = []
-        for i, filename in enumerate(pages):
+
+        items: List[PageItem] = []
+        for i, filename in enumerate(pages, start=1):
             img_url = f"{base_url}/data/{hash_val}/{filename}"
-            try:
-                img_resp = session.get(img_url, timeout=60)
-                img_resp.raise_for_status()
-                file_path = out_dir / f"chapter_{chapter_id}_{i+1:03d}.png"
-                file_path.write_bytes(img_resp.content)
-                paths.append(file_path)
-            except Exception as e:
-                log(f"[MangaDex] ERROR downloading {img_url}: {e}")
-        return paths
+            items.append(PageItem(url=img_url, index=i))
+        return items
+
+@register_scraper
+class UsagiOneScraper(GenericScraper):
+    """
+    Scraper for web.usagi.one, e.g.:
+    https://web.usagi.one/31921/vol3/14.1
+
+    Rules:
+      - Find #fotocontext
+      - For each div.manga-img-placeholder, take img.manga-img
+      - src may be in src / data-src / data-lazy-src / srcset
+    """
+    name = "usagi"
+
+    def supports(self, url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return "usagi.one" in host
+
+    def _get_img_src(self, tag) -> Optional[str]:
+        for key in ("data-src", "data-lazy-src", "src"):
+            val = tag.get(key)
+            if val:
+                return val.strip()
+        srcset = tag.get("srcset")
+        if srcset:
+            first = srcset.split(",")[0].strip().split(" ")[0]
+            if first:
+                return first
+        return None
+
+    def get_pages(self, url: str, session: requests.Session) -> Sequence[PageItem]:
+        log(f"[UsagiOne] GET {url}")
+        r = session.get(url, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        root = soup.find(id="fotocontext")
+        if not root:
+            log("[UsagiOne] WARN: #fotocontext not found")
+            return []
+
+        containers = root.select("div.manga-img-placeholder")
+        if not containers:
+            # Fallback: any img.manga-img under fotocontext
+            containers = root.select("img.manga-img")
+
+        items: List[PageItem] = []
+        idx = 1
+        for node in containers:
+            img = node if getattr(node, "name", None) == "img" else node.find("img", class_="manga-img")
+            if not img:
+                continue
+            src = self._get_img_src(img)
+            if not src:
+                continue
+            img_url = urljoin(url, src)
+            items.append(PageItem(url=img_url, index=idx))
+            idx += 1
+        return items
+
+    # Add Referer during file GETs (common requirement for readers)
+    def download_pages(self, url: str, out_dir: Path, session: requests.Session) -> List[Path]:
+        old_ref = session.headers.get("Referer")
+        session.headers["Referer"] = url
+        try:
+            return super().download_pages(url, out_dir, session)
+        finally:
+            if old_ref is None:
+                session.headers.pop("Referer", None)
+            else:
+                session.headers["Referer"] = old_ref
 
 # -----------------------------
 # Translator API
@@ -350,7 +496,8 @@ def run_translation_job(job_id, urls, batch_workers, page_workers, target_lang, 
     # overall = URL-based
     update_status(job_id, status="running", overall={"progress": 0, "total": len(urls)}, jobs=jobs_info)
     translator = TranslatorAPI(api_url=API_URL, api_key=API_PASSWORD, target_lang=target_lang, timeout=timeout, max_retries=retries)
-    strategies = [MangaDexScraper(), RawKumaScraper()]
+    # Use registry (plug-and-play)
+    strategies: List[ScraperStrategy] = list(_SCRAPER_REGISTRY)
     cfg = JobConfig(out_base=job_root, pages_workers=page_workers, rotate_90=rotate_90, target_lang=target_lang, timeout=timeout, retries=retries)
 
     with requests.Session() as session:
@@ -514,7 +661,7 @@ def retry_failed_urls(job_id):
 
     # Prep runner bits
     translator = TranslatorAPI(api_url=API_URL, api_key=API_PASSWORD)
-    strategies = [MangaDexScraper(), RawKumaScraper()]
+    strategies: List[ScraperStrategy] = list(_SCRAPER_REGISTRY)
     cfg = JobConfig(out_base=job_root, pages_workers=int(os.getenv("PAGE_WORKERS", "32")))
 
     # Mark retries as running (reset counters, KEEP folder)
@@ -547,7 +694,7 @@ def retry_failed_urls(job_id):
     # Return updated status
     with lock:
         return jsonify(json.loads(status_file.read_text()))
-    
+
 @app.route("/api/preview/<job_id>")
 def preview_image(job_id):
     """Serve the stitched PNG for a single URL folder."""
