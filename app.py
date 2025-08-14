@@ -280,6 +280,74 @@ def register_scraper(scraper_cls: type[GenericScraper]) -> type[GenericScraper]:
 # -----------------------------
 
 @register_scraper
+class WelomaScraper(GenericScraper):
+    """
+    Scraper for weloma.art chapters, e.g.:
+    https://weloma.art/3882/168664/
+
+    Structure:
+      - Container: <div class="chapter-content">
+      - Images:    <img class="chapter-img" ...> (data-srcset|srcset|data-src|src)
+    """
+    name = "weloma"
+
+    def supports(self, url: str) -> bool:
+        return "weloma.art" in urlparse(url).netloc.lower()
+
+    def _get_img_src(self, tag) -> Optional[str]:
+        # Priority: data-srcset > srcset > data-src > src
+        for key in ("data-srcset", "srcset", "data-src", "src"):
+            val = tag.get(key)
+            if val:
+                if " " in val or "," in val:  # handle srcset-like values
+                    first = val.split(",")[0].strip().split(" ")[0]
+                    if first:
+                        return first
+                return val.strip()
+        return None
+
+    def get_pages(self, url: str, session: requests.Session) -> Sequence[PageItem]:
+        log(f"[Weloma] GET {url}")
+        r = session.get(url, timeout=30)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        root = soup.select_one("div.chapter-content")
+        if not root:
+            log("[Weloma] WARN: .chapter-content not found")
+            return []
+
+        imgs = root.select("img.chapter-img")
+        items: List[PageItem] = []
+        idx = 1
+        for img in imgs:
+            src = self._get_img_src(img)
+            if not src:
+                continue
+            img_url = urljoin(url, src)
+            items.append(PageItem(url=img_url, index=idx))
+            idx += 1
+        return items
+
+    def download_pages(
+        self,
+        url: str,
+        out_dir: Path,
+        session: requests.Session,
+        on_error: Optional[Callable[[str, Exception], None]] = None
+    ) -> List[Path]:
+        old_ref = session.headers.get("Referer")
+        session.headers["Referer"] = url
+        try:
+            return super().download_pages(url, out_dir, session, on_error=on_error)
+        finally:
+            if old_ref is None:
+                session.headers.pop("Referer", None)
+            else:
+                session.headers["Referer"] = old_ref
+
+
+@register_scraper
 class RawKumaScraper(GenericScraper):
     name = "rawkuma"
 
