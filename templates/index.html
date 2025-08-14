@@ -7,14 +7,23 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   /* Modal scroll-friendly preview */
-  #previewModal.open { display: flex; }
+  #previewModal.open, #errorsModal.open { display: flex; }
+  .log-pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
 </style>
 </head>
 <body class="bg-gray-900 text-white min-h-screen">
   <div class="max-w-4xl mx-auto p-6 space-y-6">
     <header class="flex items-center justify-between">
       <h1 class="text-3xl font-bold">📖 Screen Translator</h1>
-      <div id="toast" class="hidden px-3 py-1 rounded bg-emerald-600 text-sm"></div>
+      <div class="flex items-center gap-2">
+        <button id="viewErrorsBtn" class="hidden px-3 py-1 rounded bg-rose-700 hover:bg-rose-600 text-sm">
+          View Errors <span id="errorsBadge" class="ml-2 px-1.5 py-0.5 rounded bg-black/30 text-xs">0</span>
+        </button>
+        <div id="toast" class="hidden px-3 py-1 rounded bg-emerald-600 text-sm"></div>
+      </div>
     </header>
 
     <section class="bg-gray-800 rounded-2xl p-4 shadow">
@@ -64,10 +73,55 @@ https://example.com/chapter/2"></textarea>
     </div>
   </div>
 
+  <!-- Errors Modal -->
+  <div id="errorsModal" class="hidden fixed inset-0 z-50 bg-black/80 items-center justify-center p-4">
+    <div class="relative w-full max-w-5xl bg-gray-900 rounded-2xl shadow-lg overflow-hidden">
+      <div class="flex items-center justify-between px-4 py-3 border-b border-gray-700">
+        <h2 class="text-lg font-semibold flex items-center gap-2">
+          Error Log
+          <span id="errorsTotalBadge" class="px-2 py-0.5 rounded bg-rose-700 text-xs">0</span>
+        </h2>
+        <div class="flex items-center gap-2">
+          <label class="flex items-center gap-2 text-sm opacity-90">
+            <input id="autoRefreshErrors" type="checkbox" class="accent-emerald-500">
+            Auto-refresh
+          </label>
+          <button id="refreshErrorsBtn" class="px-3 py-1 rounded bg-sky-700 hover:bg-sky-600 text-sm">Refresh</button>
+          <button id="closeErrors" class="px-3 py-1 rounded bg-rose-600 hover:bg-rose-700">Close</button>
+        </div>
+      </div>
+      <div class="grid md:grid-cols-3 gap-4 p-4">
+        <div class="md:col-span-1 space-y-2">
+          <div class="bg-gray-800 rounded-lg p-3">
+            <p class="text-sm font-semibold mb-2">Errors by URL</p>
+            <div id="errorsByUrl" class="space-y-1 text-sm"></div>
+          </div>
+          <div class="bg-gray-800 rounded-lg p-3">
+            <p class="text-sm font-semibold mb-2">Filters</p>
+            <div class="space-y-2">
+              <input id="filterText" type="text" placeholder="Search in message/code/scope…" class="w-full px-2 py-1 rounded text-black">
+              <select id="filterCode" class="w-full px-2 py-1 rounded text-black">
+                <option value="">All codes</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="md:col-span-2">
+          <div id="errorsList" class="space-y-3 max-h-[65vh] overflow-auto pr-1"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
 <script>
 const API_BASE = window.location.origin;
 let jobId = null;
 let pollTimer = null;
+let errorsPollTimer = null;
+let lastErrorsFetchTs = 0;
+let errorsCache = [];          // raw array from /api/errors/<job>
+let errorCountsByUrl = {};     // url -> count
+let knownErrorCount = 0;
 
 const $ = (sel) => document.querySelector(sel);
 const show = (el) => el.classList.remove('hidden');
@@ -96,6 +150,147 @@ function setStartLoading(isLoading) {
   btn.textContent = isLoading ? "Starting..." : "Start Translation";
 }
 
+/* ---------- Errors fetching & rendering ---------- */
+
+async function fetchErrors() {
+  if (!jobId) return { errors: [] };
+  try {
+    const res = await fetch(`${API_BASE}/api/errors/${jobId}`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Failed to get errors");
+    errorsCache = Array.isArray(data.errors) ? data.errors : [];
+    lastErrorsFetchTs = Date.now();
+    computeErrorCounts();
+    renderErrorsUI();
+    return data;
+  } catch (e) {
+    // soft fail; keep old cache
+    return { errors: errorsCache, error: e.message };
+  }
+}
+
+function computeErrorCounts() {
+  const counts = {};
+  const knownCodes = new Set();
+  for (const err of errorsCache) {
+    const sc = String(err.scope || '');
+    const url = normalizeScopeToUrl(sc);
+    if (url) counts[url] = (counts[url] || 0) + 1;
+    if (err.code) knownCodes.add(err.code);
+  }
+  errorCountsByUrl = counts;
+
+  // populate filterCode dropdown
+  const codeSel = $('#filterCode');
+  const current = codeSel.value;
+  const options = ['<option value="">All codes</option>']
+    .concat([...knownCodes].sort().map(c => `<option value="${escapeHtml(c)}">${escapeHtml(c)}</option>`));
+  codeSel.innerHTML = options.join('');
+  // restore previous selection if possible
+  if ([...codeSel.options].some(o => o.value === current)) {
+    codeSel.value = current;
+  }
+}
+
+function normalizeScopeToUrl(scope) {
+  // scopes may be exact url, or "worker:<url>", or other tokens like "api", "zip"
+  if (!scope) return null;
+  if (scope.startsWith('worker:')) return scope.slice(7);
+  try {
+    const u = new URL(scope);
+    return u.href; // is a URL
+  } catch {
+    return null;   // not a URL-ish scope
+  }
+}
+
+function renderErrorsUI() {
+  const total = errorsCache.length;
+  $('#errorsBadge').textContent = String(total);
+  $('#errorsTotalBadge').textContent = String(total);
+  knownErrorCount = total;
+
+  // show header button if any errors
+  if (total > 0) show($('#viewErrorsBtn')); else hide($('#viewErrorsBtn'));
+
+  // sidebar: counts by URL
+  const entries = Object.entries(errorCountsByUrl).sort((a,b) => b[1]-a[1]);
+  $('#errorsByUrl').innerHTML = entries.length
+    ? entries.map(([url, n]) => `
+        <div class="flex items-center justify-between gap-2">
+          <a href="#" class="text-emerald-300 hover:underline text-xs truncate" data-filter-url="${escapeHtml(url)}" title="${escapeHtml(url)}">${escapeHtml(url)}</a>
+          <span class="px-1.5 py-0.5 rounded bg-rose-700 text-xs">${n}</span>
+        </div>
+      `).join('')
+    : `<p class="text-xs opacity-70">No URL-specific errors.</p>`;
+
+  // list: apply filters
+  const ft = $('#filterText').value.trim().toLowerCase();
+  const fc = $('#filterCode').value.trim();
+
+  const filtered = errorsCache.filter(e => {
+    const hay = [
+      e.code || '',
+      e.message || '',
+      e.scope || '',
+      e.where || '',
+      JSON.stringify(e.extra || {}),
+      e.exception_type || '',
+      e.traceback || ''
+    ].join(' ').toLowerCase();
+    const passText = !ft || hay.includes(ft);
+    const passCode = !fc || (String(e.code || '') === fc);
+    return passText && passCode;
+  });
+
+  $('#errorsList').innerHTML = filtered.length
+    ? filtered.map(renderErrorCard).join('')
+    : `<div class="text-sm opacity-70">No errors matching current filters.</div>`;
+
+  // make URL filters clickable
+  document.querySelectorAll('[data-filter-url]').forEach(a => {
+    a.onclick = (e) => {
+      e.preventDefault();
+      const url = e.currentTarget.getAttribute('data-filter-url');
+      $('#filterText').value = url;
+      renderErrorsUI();
+    };
+  });
+}
+
+function renderErrorCard(e) {
+  const ts = e.ts ? new Date(e.ts).toLocaleString() : '—';
+  const scope = e.scope || '—';
+  const code = e.code || 'error';
+  const where = e.where || '';
+  const message = e.message || '';
+  const extra = e.extra ? `<div class="mt-2 text-xs text-emerald-200/90 log-pre"><strong>extra:</strong> ${escapeHtml(JSON.stringify(e.extra, null, 2))}</div>` : '';
+  const tb = e.traceback ? `<details class="mt-2">
+      <summary class="cursor-pointer text-xs text-emerald-300">Traceback</summary>
+      <pre class="log-pre text-xs bg-black/30 p-2 rounded mt-1">${escapeHtml(e.traceback)}</pre>
+    </details>` : '';
+
+  return `
+    <div class="bg-gray-800 rounded-lg p-3">
+      <div class="flex items-center justify-between gap-2">
+        <div class="flex items-center gap-2">
+          <span class="px-2 py-0.5 rounded bg-rose-700 text-xs">${escapeHtml(code)}</span>
+          ${where ? `<span class="px-2 py-0.5 rounded bg-gray-700 text-xs">${escapeHtml(where)}</span>` : ''}
+        </div>
+        <span class="text-xs opacity-70">${escapeHtml(ts)}</span>
+      </div>
+      <div class="mt-2">
+        <div class="text-xs opacity-80"><strong>scope:</strong> ${escapeHtml(scope)}</div>
+        <div class="mt-1 text-sm">${escapeHtml(message)}</div>
+        ${extra}
+        ${tb}
+      </div>
+    </div>
+  `;
+}
+
+/* ---------- Job start & polling ---------- */
+
 async function startJob() {
   const urls = parseUrls();
   if (urls.length === 0) {
@@ -122,7 +317,14 @@ async function startJob() {
     $('#jobIdBadge').textContent = `Job: ${jobId}`;
     show($('#progressSection'));
     renderInitial(urls);
+
+    // reset errors state and begin polling
+    errorsCache = [];
+    errorCountsByUrl = {};
+    updateHeaderErrors(0);
+    fetchErrors(); // initial pull
     pollStatus(true);
+    scheduleErrorsPoll(true);
   } catch (e) {
     toast(e.message || "Error starting job", false);
     setStartLoading(false);
@@ -142,20 +344,26 @@ function jobRow(url, job) {
   const status = job?.status || 'queued';
   const total = Number.isFinite(job?.total) ? job.total : 0;
   const progress = Number.isFinite(job?.progress) ? job.progress : 0;
-  const percent = total > 0 ? Math.round((progress / total) * 100) : (status === 'finished' ? 100 : 0);
+  const percent = total > 0 ? Math.round((progress / total) * 100) : (status.startsWith('finished') ? 100 : 0);
   const badge = renderBadge(status);
   const folder = job?.folder || "";
+  const urlErrCount = errorCountsByUrl[url] || 0;
+  const hasWarn = status === 'finished_with_warnings' || urlErrCount > 0;
 
   const retryBtn = status === 'failed'
     ? `<button data-url="${escapeHtml(url)}" class="retryOne px-2 py-1 text-xs bg-red-600 hover:bg-red-700 rounded">Retry</button>`
     : '';
 
-  const downloadOneBtn = (status === 'finished' && folder)
+  const downloadOneBtn = ((status === 'finished' || status === 'finished_with_warnings') && folder)
     ? `<a href="${API_BASE}/api/download-one/${jobId}?folder=${encodeURIComponent(folder)}" class="px-2 py-1 text-xs bg-amber-600 hover:bg-amber-700 rounded">Download</a>`
     : '';
 
-  const previewBtn = (status === 'finished' && folder)
+  const previewBtn = ((status === 'finished' || status === 'finished_with_warnings') && folder)
     ? `<button data-folder="${encodeURIComponent(folder)}" data-url="${escapeHtml(url)}" class="previewOne px-2 py-1 text-xs bg-teal-600 hover:bg-teal-700 rounded">Preview</button>`
+    : '';
+
+  const warnPill = hasWarn
+    ? `<span title="Errors recorded for this URL" class="px-1.5 py-0.5 rounded text-xs bg-rose-700">${urlErrCount || '!'}</span>`
     : '';
 
   return `
@@ -163,6 +371,7 @@ function jobRow(url, job) {
       <div class="flex items-center justify-between mb-1 gap-3">
         <p class="text-sm truncate" title="${escapeHtml(url)}">${escapeHtml(url)}</p>
         <div class="flex items-center gap-2">
+          ${warnPill}
           <span>${badge}</span>
           ${retryBtn}
           ${previewBtn}
@@ -184,14 +393,15 @@ function renderBadge(status) {
     finished:"bg-emerald-600",
     failed:  "bg-rose-600",
     skipped: "bg-zinc-600",
+    finished_with_warnings: "bg-yellow-600"
   };
   const cls = map[status] || "bg-slate-600";
-  const label = status.charAt(0).toUpperCase() + status.slice(1);
+  const label = status.split('_').map(s => s.charAt(0).toUpperCase()+s.slice(1)).join(' ');
   return `<span class="px-2 py-0.5 rounded text-xs ${cls}">${label}</span>`;
 }
 
 function escapeHtml(s) {
-  return s.replace(/[&<>"']/g, c =>
+  return String(s).replace(/[&<>"']/g, c =>
     ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])
   );
 }
@@ -218,7 +428,7 @@ async function pollStatus(first=false) {
     const hasFailed = Object.values(jobs).some(j => j?.status === 'failed');
     if (hasFailed) show($('#retryAllBtn')); else hide($('#retryAllBtn'));
 
-    const finishedCount = Object.values(jobs).filter(j => j?.status === 'finished').length;
+    const finishedCount = Object.values(jobs).filter(j => j?.status === 'finished' || j?.status === 'finished_with_warnings').length;
     if (finishedCount > 0) show($('#downloadFinishedBtn')); else hide($('#downloadFinishedBtn'));
 
     if (data.status === 'finished') {
@@ -240,7 +450,6 @@ async function pollStatus(first=false) {
     document.querySelectorAll('.previewOne').forEach(btn => {
       btn.onclick = (e) => {
         const folder = e.currentTarget.getAttribute('data-folder');
-        const url = decodeURIComponent(folder); // not shown, but we set title below separately
         openPreview(folder, e.currentTarget.getAttribute('data-url') || '');
       };
     });
@@ -249,6 +458,31 @@ async function pollStatus(first=false) {
     clearTimeout(pollTimer);
     pollTimer = setTimeout(pollStatus, 2500);
   }
+}
+
+function updateHeaderErrors(n) {
+  $('#errorsBadge').textContent = String(n);
+  $('#errorsTotalBadge').textContent = String(n);
+  if (n > 0) show($('#viewErrorsBtn')); else hide($('#viewErrorsBtn'));
+}
+
+function scheduleErrorsPoll(immediate=false) {
+  if (!jobId) return;
+  if (errorsPollTimer) clearTimeout(errorsPollTimer);
+  const poll = async () => {
+    const before = knownErrorCount;
+    await fetchErrors();
+    const after = errorsCache.length;
+    updateHeaderErrors(after);
+    // if new errors arrived, ping user
+    if (after > before) {
+      toast(`${after - before} new error(s)`, false);
+    }
+    // keep polling while job not finished OR auto-refresh is on
+    const auto = $('#autoRefreshErrors').checked;
+    errorsPollTimer = setTimeout(poll, auto ? 2000 : 4000);
+  };
+  if (immediate) poll(); else (errorsPollTimer = setTimeout(poll, 1500));
 }
 
 async function retryUrls(urls) {
@@ -264,6 +498,8 @@ async function retryUrls(urls) {
     toast(urls && urls.length ? "Retry queued" : "Retrying failed URLs");
     clearTimeout(pollTimer);
     pollStatus(true);
+    // also refresh errors after retry kicks off
+    scheduleErrorsPoll(true);
   } catch (e) {
     toast(e.message || "Retry error", false);
   }
@@ -285,6 +521,20 @@ function closePreview() {
   $('#previewModal').classList.remove('open');
 }
 
+/* ---------- Errors modal helpers ---------- */
+function openErrors() {
+  $('#errorsModal').classList.add('open');
+  show($('#errorsModal'));
+  scheduleErrorsPoll(true);
+}
+function closeErrors() {
+  hide($('#errorsModal'));
+  $('#errorsModal').classList.remove('open');
+}
+function onFiltersChanged() {
+  renderErrorsUI();
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   const params = new URLSearchParams(window.location.search);
   const savedJob = params.get('job');
@@ -293,6 +543,10 @@ document.addEventListener('DOMContentLoaded', () => {
     $('#jobIdBadge').textContent = `Job: ${jobId}`;
     show($('#progressSection'));
     pollStatus(true);
+    fetchErrors().then(() => {
+      updateHeaderErrors(errorsCache.length);
+      scheduleErrorsPoll(true);
+    });
   }
 
   $('#startBtn').onclick = startJob;
@@ -302,13 +556,27 @@ document.addEventListener('DOMContentLoaded', () => {
     window.location.href = `${API_BASE}/api/download-finished/${jobId}`;
   };
 
-  // modal events
+  // modal events: preview
   $('#closePreview').onclick = closePreview;
   $('#previewModal').addEventListener('click', (e) => {
     if (e.target === $('#previewModal')) closePreview();
   });
+  // modal events: errors
+  $('#viewErrorsBtn').onclick = openErrors;
+  $('#closeErrors').onclick = closeErrors;
+  $('#refreshErrorsBtn').onclick = () => fetchErrors();
+  $('#errorsModal').addEventListener('click', (e) => {
+    if (e.target === $('#errorsModal')) closeErrors();
+  });
+  $('#filterText').addEventListener('input', onFiltersChanged);
+  $('#filterCode').addEventListener('change', onFiltersChanged);
+  $('#autoRefreshErrors').addEventListener('change', () => scheduleErrorsPoll(true));
+
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closePreview();
+    if (e.key === 'Escape') {
+      closePreview();
+      closeErrors();
+    }
   });
 });
 </script>
